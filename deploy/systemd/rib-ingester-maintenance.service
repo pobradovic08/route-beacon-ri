@@ -1,0 +1,14 @@
+[Unit]
+Description=RIB Ingester Partition Maintenance
+After=network.target postgresql.service
+
+[Service]
+Type=oneshot
+User=rib-ingester
+Group=rib-ingester
+ExecStart=/opt/rib-ingester/rib-ingester maintenance --config /etc/rib-ingester/config.yaml
+Restart=on-failure
+RestartSec=300
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rib-ingester-maintenance

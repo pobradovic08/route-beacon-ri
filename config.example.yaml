@@ -1,0 +1,62 @@
+service:
+  instance_id: "rib-ingester-1"       # Instance identifier for logging
+  http_listen: ":8080"                # HTTP server bind address
+  log_level: "info"                   # debug, info, warn, error
+  shutdown_timeout_seconds: 30        # Max time to drain on shutdown
+
+kafka:
+  brokers:
+    - "kafka01:9092"
+    - "kafka02:9092"
+  client_id: "rib-ingester"
+
+  # TLS configuration (optional)
+  tls:
+    enabled: false
+    ca_file: ""
+    cert_file: ""
+    key_file: ""
+
+  # SASL authentication (optional)
+  sasl:
+    enabled: false
+    mechanism: ""                     # PLAIN, SCRAM-SHA-256, SCRAM-SHA-512
+    username: ""
+    password: ""
+
+  # State pipeline: parsed JSON topics (4 unicast prefix + 2 peer)
+  state:
+    group_id: "rib-ingester-state"
+    topics:
+      - "cola.gobmp.parsed.unicast_prefix_v4"
+      - "cola.gobmp.parsed.unicast_prefix_v6"
+      - "colb.gobmp.parsed.unicast_prefix_v4"
+      - "colb.gobmp.parsed.unicast_prefix_v6"
+      - "cola.gobmp.parsed.peer"
+      - "colb.gobmp.parsed.peer"
+
+  # History pipeline: raw BMP topics
+  history:
+    group_id: "rib-ingester-history"
+    topics:
+      - "cola.gobmp.bmp_raw"
+      - "colb.gobmp.bmp_raw"
+
+  fetch_max_bytes: 52428800           # 50MiB max fetch response size
+
+postgres:
+  dsn: "postgres://user:pass@db01:5432/rib?sslmode=disable"
+  max_conns: 20                       # Maximum connections in pool
+  min_conns: 2                        # Minimum idle connections
+
+ingest:
+  batch_size: 1000                    # Max messages per DB batch
+  flush_interval_ms: 200              # Max time before flushing partial batch
+  channel_buffer_size: 16             # Bounded channel capacity (number of batches)
+  max_payload_bytes: 16777216         # 16MiB max BMP message size
+  store_raw_bytes: false              # Store raw BMP bytes in route_events.bmp_raw
+  store_raw_bytes_compress: true      # Compress raw bytes with zstd (if store_raw_bytes=true)
+
+retention:
+  days: 30                            # Days to retain route_events partitions
+  timezone: "Europe/Belgrade"         # Timezone for partition boundary calculations
