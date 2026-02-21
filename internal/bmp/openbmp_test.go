@@ -91,6 +91,75 @@ func TestDecodeOpenBMPFrame_TruncatedPayload(t *testing.T) {
 	}
 }
 
+// buildOpenBMPV17Frame builds an OpenBMP v1.7 binary frame ("OBMP" magic).
+func buildOpenBMPV17Frame(payload []byte) []byte {
+	hdrLen := uint16(78) // minimum header with no collector admin ID and no router group
+	frame := make([]byte, int(hdrLen)+len(payload))
+	binary.BigEndian.PutUint32(frame[0:4], 0x4F424D50) // "OBMP" magic
+	frame[4] = 1                                        // major version
+	frame[5] = 7                                        // minor version
+	binary.BigEndian.PutUint16(frame[6:8], hdrLen)
+	binary.BigEndian.PutUint32(frame[8:12], uint32(len(payload)))
+	frame[12] = 0x80 // flags: router message
+	frame[13] = 12   // message type: BMP_RAW
+	// timestamps, hashes, router IP, etc. are zeroed (not used by decoder)
+	copy(frame[hdrLen:], payload)
+	return frame
+}
+
+func TestDecodeOpenBMPFrame_V17Valid(t *testing.T) {
+	payload := []byte{0x03, 0x00, 0x00, 0x00, 0x06, 0x04}
+	frame := buildOpenBMPV17Frame(payload)
+
+	bmpBytes, err := DecodeOpenBMPFrame(frame, 16*1024*1024)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(bmpBytes) != len(payload) {
+		t.Fatalf("expected %d bytes, got %d", len(payload), len(bmpBytes))
+	}
+	for i := range payload {
+		if bmpBytes[i] != payload[i] {
+			t.Fatalf("byte %d: expected 0x%02x, got 0x%02x", i, payload[i], bmpBytes[i])
+		}
+	}
+}
+
+func TestDecodeOpenBMPFrame_V17Truncated(t *testing.T) {
+	payload := []byte{0x03, 0x00, 0x00, 0x00, 0x06, 0x04}
+	frame := buildOpenBMPV17Frame(payload)
+	truncated := frame[:20] // cut short
+
+	_, err := DecodeOpenBMPFrame(truncated, 16*1024*1024)
+	if err == nil {
+		t.Fatal("expected error for truncated v1.7 frame")
+	}
+}
+
+func TestDecodeOpenBMPFrame_V17ZeroMsgLen(t *testing.T) {
+	frame := make([]byte, 78)
+	binary.BigEndian.PutUint32(frame[0:4], 0x4F424D50)
+	frame[4] = 1
+	frame[5] = 7
+	binary.BigEndian.PutUint16(frame[6:8], 78)
+	binary.BigEndian.PutUint32(frame[8:12], 0) // msg_len = 0
+
+	_, err := DecodeOpenBMPFrame(frame, 16*1024*1024)
+	if err == nil {
+		t.Fatal("expected error for zero msg_len in v1.7")
+	}
+}
+
+func TestDecodeOpenBMPFrame_V17Oversized(t *testing.T) {
+	payload := []byte{0x03, 0x00, 0x00, 0x00, 0x06, 0x04}
+	frame := buildOpenBMPV17Frame(payload)
+
+	_, err := DecodeOpenBMPFrame(frame, 2) // max 2 bytes
+	if err == nil {
+		t.Fatal("expected error for oversized v1.7 payload")
+	}
+}
+
 func TestDecodeOpenBMPFrame_MultipleFrames(t *testing.T) {
 	payload1 := []byte{0x01, 0x02, 0x03}
 	payload2 := []byte{0x04, 0x05}
