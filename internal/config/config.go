@@ -147,8 +147,14 @@ func (c *Config) Validate() error {
 	if c.Postgres.DSN == "" {
 		return fmt.Errorf("config: postgres.dsn is required")
 	}
+	if c.Kafka.State.GroupID == "" {
+		return fmt.Errorf("config: kafka.state.group_id is required")
+	}
 	if len(c.Kafka.State.Topics) == 0 {
 		return fmt.Errorf("config: kafka.state.topics is required")
+	}
+	if c.Kafka.History.GroupID == "" {
+		return fmt.Errorf("config: kafka.history.group_id is required")
 	}
 	if len(c.Kafka.History.Topics) == 0 {
 		return fmt.Errorf("config: kafka.history.topics is required")

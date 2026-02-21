@@ -275,6 +275,12 @@ func parsePrefixes(data []byte, ipVersion int, hasAddPath bool) []PrefixInfo {
 		prefixLen := int(data[offset])
 		offset++
 
+		// Reject prefix lengths that exceed the AFI maximum.
+		maxBits := maxIPLen(ipVersion) * 8
+		if prefixLen > maxBits {
+			break
+		}
+
 		// Number of bytes needed for the prefix.
 		byteLen := (prefixLen + 7) / 8
 		if offset+byteLen > len(data) {

@@ -31,7 +31,7 @@ type ParsedRoute struct {
 // PeerEvent represents a decoded goBMP peer topic message for session lifecycle.
 type PeerEvent struct {
 	RouterID string
-	Action   string // "down", "up"
+	Action   string // "peer_down", "peer_up"
 	IsLocRIB bool
 }
 

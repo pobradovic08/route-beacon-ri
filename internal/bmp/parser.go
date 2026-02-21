@@ -52,7 +52,7 @@ func parseRouteMonitoring(data []byte, result *ParsedBMP) (*ParsedBMP, error) {
 	}
 
 	result.PeerType = data[0]
-	result.PeerFlags = binary.BigEndian.Uint16(data[1:3])
+	result.PeerFlags = data[1]
 	result.IsLocRIB = result.PeerType == PeerTypeLocRIB
 	result.HasAddPath = (result.PeerFlags & PeerFlagAddPath) != 0
 
@@ -146,8 +146,8 @@ func RouterIDFromPeerHeader(data []byte) string {
 	if len(data) < 42 {
 		return ""
 	}
-	// Peer address is at offset 3+8 = 11, 16 bytes (IPv6-mapped).
-	addr := data[11:27]
+	// Peer address is at offset 1+1+8 = 10, 16 bytes (IPv6-mapped).
+	addr := data[10:26]
 	ip := net.IP(addr)
 	// Check if it's an IPv4-mapped IPv6 address.
 	if v4 := ip.To4(); v4 != nil {
