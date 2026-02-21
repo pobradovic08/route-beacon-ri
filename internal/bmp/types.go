@@ -30,6 +30,13 @@ const (
 	TLVTypeTableName uint16 = 0
 )
 
+// TLV type codes for BMP Initiation message (RFC 7854 §4.3).
+const (
+	InitTLVString   uint16 = 0 // Free-form informational string.
+	InitTLVSysDescr uint16 = 1 // sysDescr (MIB-II).
+	InitTLVSysName  uint16 = 2 // sysName (MIB-II).
+)
+
 // BMPVersion is the expected BMP protocol version.
 const BMPVersion uint8 = 3
 
@@ -39,11 +46,16 @@ const PeerFlagAddPath uint16 = 0x0100
 
 // ParsedBMP represents a parsed BMP message.
 type ParsedBMP struct {
-	MsgType   uint8
-	PeerType  uint8
-	PeerFlags uint16
-	IsLocRIB  bool
+	MsgType    uint8
+	PeerType   uint8
+	PeerFlags  uint16
+	IsLocRIB   bool
 	HasAddPath bool
-	TableName string
-	BGPData   []byte // The encapsulated BGP message bytes
+	TableName  string
+	BGPData    []byte // The encapsulated BGP message bytes
+
+	// Initiation message fields (RFC 7854 §4.3).
+	SysName     string   // From TLV type 2.
+	SysDescr    string   // From TLV type 1.
+	InfoStrings []string // From TLV type 0 (free-form strings).
 }

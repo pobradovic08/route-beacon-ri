@@ -13,9 +13,9 @@ func buildBMPRouteMonitoring(peerType uint8, bgpPayload []byte) []byte {
 	totalLen := 6 + 42 + len(bgpPayload)
 
 	msg := make([]byte, totalLen)
-	msg[0] = BMPVersion                                             // version
-	binary.BigEndian.PutUint32(msg[1:5], uint32(totalLen))          // msg_length
-	msg[5] = MsgTypeRouteMonitoring                                 // msg_type
+	msg[0] = BMPVersion                                    // version
+	binary.BigEndian.PutUint32(msg[1:5], uint32(totalLen)) // msg_length
+	msg[5] = MsgTypeRouteMonitoring                        // msg_type
 
 	// Per-peer header starts at offset 6
 	msg[6] = peerType // peer_type
@@ -39,6 +39,27 @@ func buildMinimalBGPUpdate() []byte {
 	msg[18] = 2                                 // type = UPDATE
 	// withdrawn_len = 0, path_attr_len = 0 (already zero)
 	return msg
+}
+
+// buildBMPInitiation builds a BMP Initiation message (type 4) with the given TLVs.
+// TLVs follow directly after the Common Header (no Per-Peer Header).
+func buildBMPInitiation(tlvs []byte) []byte {
+	totalLen := CommonHeaderSize + len(tlvs)
+	msg := make([]byte, totalLen)
+	msg[0] = BMPVersion
+	binary.BigEndian.PutUint32(msg[1:5], uint32(totalLen))
+	msg[5] = MsgTypeInitiation
+	copy(msg[CommonHeaderSize:], tlvs)
+	return msg
+}
+
+// buildTLV builds a single BMP TLV (Type-Length-Value).
+func buildTLV(tlvType uint16, value string) []byte {
+	tlv := make([]byte, 4+len(value))
+	binary.BigEndian.PutUint16(tlv[0:2], tlvType)
+	binary.BigEndian.PutUint16(tlv[2:4], uint16(len(value)))
+	copy(tlv[4:], value)
+	return tlv
 }
 
 func TestParse_LocRIB(t *testing.T) {
@@ -264,5 +285,114 @@ func TestParse_AddPathFlag(t *testing.T) {
 	}
 	if !parsed.HasAddPath {
 		t.Error("expected HasAddPath=true when F flag is set")
+	}
+}
+
+// --- BMP Initiation message tests ---
+
+func TestParse_Initiation_SysNameAndSysDescr(t *testing.T) {
+	var tlvs []byte
+	tlvs = append(tlvs, buildTLV(InitTLVSysName, "router1.lab")...)
+	tlvs = append(tlvs, buildTLV(InitTLVSysDescr, "FRRouting 10.3.1")...)
+	msg := buildBMPInitiation(tlvs)
+
+	parsed, err := Parse(msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if parsed.MsgType != MsgTypeInitiation {
+		t.Errorf("expected MsgType=%d, got %d", MsgTypeInitiation, parsed.MsgType)
+	}
+	if parsed.SysName != "router1.lab" {
+		t.Errorf("expected SysName=router1.lab, got %q", parsed.SysName)
+	}
+	if parsed.SysDescr != "FRRouting 10.3.1" {
+		t.Errorf("expected SysDescr=FRRouting 10.3.1, got %q", parsed.SysDescr)
+	}
+}
+
+func TestParse_Initiation_ZeroTLVs(t *testing.T) {
+	msg := buildBMPInitiation(nil)
+
+	parsed, err := Parse(msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if parsed.MsgType != MsgTypeInitiation {
+		t.Errorf("expected MsgType=%d, got %d", MsgTypeInitiation, parsed.MsgType)
+	}
+	if parsed.SysName != "" {
+		t.Errorf("expected empty SysName, got %q", parsed.SysName)
+	}
+}
+
+func TestParse_Initiation_SysNameOnly(t *testing.T) {
+	tlvs := buildTLV(InitTLVSysName, "edge-rtr")
+	msg := buildBMPInitiation(tlvs)
+
+	parsed, err := Parse(msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if parsed.SysName != "edge-rtr" {
+		t.Errorf("expected SysName=edge-rtr, got %q", parsed.SysName)
+	}
+	if parsed.SysDescr != "" {
+		t.Errorf("expected empty SysDescr, got %q", parsed.SysDescr)
+	}
+}
+
+func TestParse_Initiation_UnknownTLVTypes(t *testing.T) {
+	var tlvs []byte
+	tlvs = append(tlvs, buildTLV(InitTLVSysName, "myrouter")...)
+	tlvs = append(tlvs, buildTLV(99, "unknown-value")...) // Unknown TLV type
+	msg := buildBMPInitiation(tlvs)
+
+	parsed, err := Parse(msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if parsed.SysName != "myrouter" {
+		t.Errorf("expected SysName=myrouter, got %q", parsed.SysName)
+	}
+}
+
+func TestParse_Initiation_InfoStrings(t *testing.T) {
+	var tlvs []byte
+	tlvs = append(tlvs, buildTLV(InitTLVString, "first info")...)
+	tlvs = append(tlvs, buildTLV(InitTLVString, "second info")...)
+	tlvs = append(tlvs, buildTLV(InitTLVSysName, "rtr1")...)
+	msg := buildBMPInitiation(tlvs)
+
+	parsed, err := Parse(msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(parsed.InfoStrings) != 2 {
+		t.Fatalf("expected 2 info strings, got %d", len(parsed.InfoStrings))
+	}
+	if parsed.InfoStrings[0] != "first info" {
+		t.Errorf("expected InfoStrings[0]=first info, got %q", parsed.InfoStrings[0])
+	}
+	if parsed.InfoStrings[1] != "second info" {
+		t.Errorf("expected InfoStrings[1]=second info, got %q", parsed.InfoStrings[1])
+	}
+}
+
+func TestParse_Initiation_MalformedTLV(t *testing.T) {
+	var tlvs []byte
+	tlvs = append(tlvs, buildTLV(InitTLVSysName, "good-rtr")...)
+	// Add malformed TLV: claims 200 bytes but only 3 available.
+	malformed := []byte{0x00, 0x01, 0x00, 0xC8, 0xAA, 0xBB, 0xCC}
+	tlvs = append(tlvs, malformed...)
+	msg := buildBMPInitiation(tlvs)
+
+	parsed, err := Parse(msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Should still have parsed the first valid TLV.
+	if parsed.SysName != "good-rtr" {
+		t.Errorf("expected SysName=good-rtr, got %q", parsed.SysName)
 	}
 }

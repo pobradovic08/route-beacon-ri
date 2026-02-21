@@ -32,6 +32,7 @@ func (pm *PartitionManager) Run(ctx context.Context) error {
 	if err := pm.DropOldPartitions(ctx); err != nil {
 		return fmt.Errorf("dropping old partitions: %w", err)
 	}
+	pm.RefreshRouteSummary(ctx)
 	return nil
 }
 
@@ -144,4 +145,14 @@ func (pm *PartitionManager) DropOldPartitions(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// RefreshRouteSummary refreshes the route_summary materialized view concurrently.
+func (pm *PartitionManager) RefreshRouteSummary(ctx context.Context) {
+	_, err := pm.pool.Exec(ctx, "REFRESH MATERIALIZED VIEW CONCURRENTLY route_summary")
+	if err != nil {
+		pm.logger.Warn("failed to refresh route_summary materialized view", zap.Error(err))
+		return
+	}
+	pm.logger.Info("route_summary materialized view refreshed")
 }

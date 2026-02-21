@@ -54,7 +54,7 @@ func (p *Pipeline) Run(ctx context.Context, records <-chan []*kgo.Record, flushe
 			}
 
 			for _, rec := range recs {
-				rows := p.processRecord(rec)
+				rows := p.processRecord(ctx, rec)
 				if len(rows) > 0 {
 					batch = append(batch, rows...)
 				}
@@ -79,9 +79,9 @@ func (p *Pipeline) Run(ctx context.Context, records <-chan []*kgo.Record, flushe
 	}
 }
 
-func (p *Pipeline) processRecord(rec *kgo.Record) []*HistoryRow {
+func (p *Pipeline) processRecord(ctx context.Context, rec *kgo.Record) []*HistoryRow {
 	// Step 1: Decode OpenBMP frame.
-	bmpBytes, err := DecodeOpenBMPFrame(rec.Value, p.maxPayloadBytes)
+	frame, err := DecodeOpenBMPFrame(rec.Value, p.maxPayloadBytes)
 	if err != nil {
 		metrics.ParseErrorsTotal.WithLabelValues("openbmp", "decode").Inc()
 		p.logger.Warn("failed to decode OpenBMP frame",
@@ -91,11 +91,8 @@ func (p *Pipeline) processRecord(rec *kgo.Record) []*HistoryRow {
 		return nil
 	}
 
-	// Step 2: Compute event_id (SHA256 of BMP bytes, NOT OpenBMP wrapper).
-	eventID := ComputeEventID(bmpBytes)
-
-	// Step 3: Parse BMP message.
-	parsed, err := bmp.Parse(bmpBytes)
+	// Step 2: Parse BMP message.
+	parsed, err := bmp.Parse(frame.BMPBytes)
 	if err != nil {
 		metrics.ParseErrorsTotal.WithLabelValues("bmp", "parse").Inc()
 		p.logger.Warn("failed to parse BMP message",
@@ -105,18 +102,28 @@ func (p *Pipeline) processRecord(rec *kgo.Record) []*HistoryRow {
 		return nil
 	}
 
-	// Filter: only process Loc-RIB Route Monitoring messages.
-	if !parsed.IsLocRIB {
+	// Dispatch based on BMP message type.
+	switch parsed.MsgType {
+	case bmp.MsgTypeRouteMonitoring:
+		return p.processRouteMonitoring(rec, frame, parsed)
+	case bmp.MsgTypeInitiation:
+		p.processInitiation(ctx, rec, frame, parsed)
+		return nil
+	default:
 		return nil
 	}
-	if parsed.MsgType != bmp.MsgTypeRouteMonitoring {
+}
+
+func (p *Pipeline) processRouteMonitoring(rec *kgo.Record, frame FrameResult, parsed *bmp.ParsedBMP) []*HistoryRow {
+	if !parsed.IsLocRIB {
 		return nil
 	}
 	if parsed.BGPData == nil {
 		return nil
 	}
 
-	// Step 4: Parse BGP UPDATE.
+	eventID := ComputeEventID(frame.BMPBytes)
+
 	events, err := bgp.ParseUpdate(parsed.BGPData, parsed.HasAddPath)
 	if err != nil {
 		metrics.ParseErrorsTotal.WithLabelValues("bgp", "parse").Inc()
@@ -131,7 +138,6 @@ func (p *Pipeline) processRecord(rec *kgo.Record) []*HistoryRow {
 		return nil
 	}
 
-	// Build history rows.
 	var rows []*HistoryRow
 	for _, ev := range events {
 		afiStr := fmt.Sprintf("%d", ev.AFI)
@@ -139,15 +145,43 @@ func (p *Pipeline) processRecord(rec *kgo.Record) []*HistoryRow {
 
 		rows = append(rows, &HistoryRow{
 			EventID:   eventID,
-			RouterID:  bmp.RouterIDFromPeerHeader(bmpBytes[bmp.CommonHeaderSize:]),
+			RouterID:  bmp.RouterIDFromPeerHeader(frame.BMPBytes[bmp.CommonHeaderSize:]),
 			TableName: parsed.TableName,
 			Event:     ev,
-			BMPRaw:    bmpBytes,
+			BMPRaw:    frame.BMPBytes,
 			Topic:     rec.Topic,
 		})
 	}
 
 	return rows
+}
+
+func (p *Pipeline) processInitiation(ctx context.Context, rec *kgo.Record, frame FrameResult, parsed *bmp.ParsedBMP) {
+	metrics.KafkaMessagesTotal.WithLabelValues("history", rec.Topic, "", "initiation").Inc()
+
+	routerIP := frame.RouterIP
+	if routerIP == "" {
+		p.logger.Warn("initiation message has no router IP (legacy OBMP format?)",
+			zap.String("topic", rec.Topic),
+		)
+		return
+	}
+
+	routerID := routerIP
+	if err := UpsertRouter(ctx, p.writer.pool, routerID, routerIP, parsed.SysName, parsed.SysDescr); err != nil {
+		p.logger.Warn("failed to upsert router from initiation",
+			zap.String("router_id", routerID),
+			zap.String("sys_name", parsed.SysName),
+			zap.Error(err),
+		)
+		return
+	}
+
+	p.logger.Info("router metadata upserted from BMP initiation",
+		zap.String("router_id", routerID),
+		zap.String("sys_name", parsed.SysName),
+		zap.String("sys_descr", parsed.SysDescr),
+	)
 }
 
 func (p *Pipeline) flush(ctx context.Context, batch []*HistoryRow, records []*kgo.Record, flushed chan<- []*kgo.Record) bool {

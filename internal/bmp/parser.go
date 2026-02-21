@@ -37,6 +37,8 @@ func Parse(data []byte) (*ParsedBMP, error) {
 		return parseRouteMonitoring(data[CommonHeaderSize:msgLength], result)
 	case MsgTypePeerDown:
 		return parsePeerDown(data[CommonHeaderSize:msgLength], result)
+	case MsgTypeInitiation:
+		return parseInitiation(data[CommonHeaderSize:msgLength], result)
 	case MsgTypeTermination:
 		result.MsgType = MsgTypeTermination
 		return result, nil
@@ -104,6 +106,37 @@ func parsePeerDown(data []byte, result *ParsedBMP) (*ParsedBMP, error) {
 	result.PeerType = data[0]
 	result.IsLocRIB = result.PeerType == PeerTypeLocRIB
 
+	return result, nil
+}
+
+// parseInitiation parses BMP Initiation message TLVs (RFC 7854 §4.3).
+// Initiation messages have NO Per-Peer Header — TLVs follow directly after the Common Header.
+// TLV format: Type(2) + Length(2) + Value(variable).
+func parseInitiation(data []byte, result *ParsedBMP) (*ParsedBMP, error) {
+	offset := 0
+	for offset+4 <= len(data) {
+		tlvType := binary.BigEndian.Uint16(data[offset : offset+2])
+		tlvLen := int(binary.BigEndian.Uint16(data[offset+2 : offset+4]))
+		offset += 4
+
+		if offset+tlvLen > len(data) {
+			break // Malformed TLV — stop parsing gracefully.
+		}
+
+		value := string(data[offset : offset+tlvLen])
+		switch tlvType {
+		case InitTLVString:
+			result.InfoStrings = append(result.InfoStrings, value)
+		case InitTLVSysDescr:
+			result.SysDescr = value
+		case InitTLVSysName:
+			result.SysName = value
+		default:
+			// Unknown TLV types are silently skipped (RFC-compliant tolerance).
+		}
+
+		offset += tlvLen
+	}
 	return result, nil
 }
 
