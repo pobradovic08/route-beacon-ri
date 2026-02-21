@@ -42,7 +42,9 @@ func (p *Pipeline) Run(ctx context.Context, records <-chan []*kgo.Record, flushe
 		select {
 		case <-ctx.Done():
 			if len(batchRecords) > 0 {
-				p.flush(ctx, batch, batchRecords, flushed)
+				shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer shutdownCancel()
+				p.flush(shutdownCtx, batch, batchRecords, flushed)
 			}
 			return
 
@@ -126,7 +128,7 @@ func (p *Pipeline) processRecord(rec *kgo.Record) []*HistoryRow {
 			continue
 		}
 
-		// Compute event_id per BMP message (SHA256 of individual BMP bytes).
+		// Validate BMP message bounds.
 		msgEnd := parsed.Offset + bmp.CommonHeaderSize
 		if msgEnd > len(bmpBytes) {
 			continue
@@ -135,7 +137,7 @@ func (p *Pipeline) processRecord(rec *kgo.Record) []*HistoryRow {
 		if parsed.Offset+msgLen > len(bmpBytes) {
 			continue
 		}
-		eventID := ComputeEventID(bmpBytes[parsed.Offset : parsed.Offset+msgLen])
+		bmpMsgBytes := bmpBytes[parsed.Offset : parsed.Offset+msgLen]
 
 		// ParseUpdateAutoDetect handles routers that send Add-Path
 		// encoded NLRI without setting the F-bit (e.g. Arista cEOS).
@@ -165,15 +167,25 @@ func (p *Pipeline) processRecord(rec *kgo.Record) []*HistoryRow {
 		}
 
 		for _, ev := range events {
+			// Per-prefix event_id: hash BMP msg bytes + prefix + action.
+			// Use explicit allocation instead of append(bmpMsgBytes, ...) to
+			// avoid corrupting the underlying bmpBytes array when bmpMsgBytes
+			// is a sub-slice with excess capacity.
+			suffix := []byte(ev.Prefix + "/" + ev.Action)
+			perPrefixData := make([]byte, len(bmpMsgBytes)+len(suffix))
+			copy(perPrefixData, bmpMsgBytes)
+			copy(perPrefixData[len(bmpMsgBytes):], suffix)
+			rowEventID := ComputeEventID(perPrefixData)
+
 			afiStr := fmt.Sprintf("%d", ev.AFI)
 			metrics.KafkaMessagesTotal.WithLabelValues("history", rec.Topic, afiStr, ev.Action).Inc()
 
 			rows = append(rows, &HistoryRow{
-				EventID:   eventID,
+				EventID:   rowEventID,
 				RouterID:  routerID,
 				TableName: parsed.TableName,
 				Event:     ev,
-				BMPRaw:    bmpBytes[parsed.Offset : parsed.Offset+msgLen],
+				BMPRaw:    bmpMsgBytes,
 				Topic:     rec.Topic,
 			})
 		}

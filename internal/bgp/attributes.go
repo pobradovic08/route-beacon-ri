@@ -13,8 +13,8 @@ type PathAttributes struct {
 	Origin    string
 	ASPath    string
 	Nexthop   string
-	MED       *int32
-	LocalPref *int32
+	MED       *uint32
+	LocalPref *uint32
 	CommStd   []string
 	CommExt   []string
 	CommLarge []string
@@ -151,14 +151,14 @@ func parseNextHop(data []byte, attrs *PathAttributes) {
 
 func parseMED(data []byte, attrs *PathAttributes) {
 	if len(data) == 4 {
-		v := int32(binary.BigEndian.Uint32(data))
+		v := uint32(binary.BigEndian.Uint32(data))
 		attrs.MED = &v
 	}
 }
 
 func parseLocalPref(data []byte, attrs *PathAttributes) {
 	if len(data) == 4 {
-		v := int32(binary.BigEndian.Uint32(data))
+		v := uint32(binary.BigEndian.Uint32(data))
 		attrs.LocalPref = &v
 	}
 }
@@ -239,7 +239,9 @@ func parseMPReachNLRI(data []byte, attrs *PathAttributes, hasAddPath bool) {
 	}
 
 	// Parse NLRI.
-	attrs.MPReachNLRI = parsePrefixes(data[offset:], afiToVersion(afi), hasAddPath)
+	if v := afiToVersion(afi); v != 0 {
+		attrs.MPReachNLRI = parsePrefixes(data[offset:], v, hasAddPath)
+	}
 }
 
 func parseMPUnreachNLRI(data []byte, attrs *PathAttributes, hasAddPath bool) {

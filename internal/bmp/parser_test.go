@@ -2,6 +2,7 @@ package bmp
 
 import (
 	"encoding/binary"
+	"net"
 	"testing"
 )
 
@@ -318,5 +319,254 @@ func TestRouterIDFromPeerHeader_TooShort(t *testing.T) {
 	routerID := RouterIDFromPeerHeader([]byte{0, 0, 0})
 	if routerID != "" {
 		t.Errorf("expected empty router ID for short data, got '%s'", routerID)
+	}
+}
+
+// --- C4. ParseAll multi-message tests ---
+
+func TestParseAll_MultipleConcatenated(t *testing.T) {
+	bgp := buildMinimalBGPUpdate()
+	msg1 := buildBMPRouteMonitoring(PeerTypeLocRIB, bgp)
+	msg2 := buildBMPRouteMonitoring(PeerTypeGlobal, bgp)
+	msg3 := buildBMPRouteMonitoring(PeerTypeLocRIB, bgp)
+
+	combined := make([]byte, 0, len(msg1)+len(msg2)+len(msg3))
+	combined = append(combined, msg1...)
+	combined = append(combined, msg2...)
+	combined = append(combined, msg3...)
+
+	results, err := ParseAll(combined)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(results) != 3 {
+		t.Fatalf("expected 3 parsed messages, got %d", len(results))
+	}
+	if results[0].Offset != 0 {
+		t.Errorf("expected first message Offset=0, got %d", results[0].Offset)
+	}
+	if results[1].Offset != len(msg1) {
+		t.Errorf("expected second message Offset=%d, got %d", len(msg1), results[1].Offset)
+	}
+	if results[2].Offset != len(msg1)+len(msg2) {
+		t.Errorf("expected third message Offset=%d, got %d", len(msg1)+len(msg2), results[2].Offset)
+	}
+	if !results[0].IsLocRIB {
+		t.Error("expected first message IsLocRIB=true")
+	}
+	if results[1].IsLocRIB {
+		t.Error("expected second message IsLocRIB=false")
+	}
+	if !results[2].IsLocRIB {
+		t.Error("expected third message IsLocRIB=true")
+	}
+}
+
+func TestParseAll_MixedValidInvalid(t *testing.T) {
+	bgp := buildMinimalBGPUpdate()
+	valid1 := buildBMPRouteMonitoring(PeerTypeLocRIB, bgp)
+	valid2 := buildBMPRouteMonitoring(PeerTypeGlobal, bgp)
+
+	// Build an invalid message: correct structure but bad BMP version byte.
+	invalid := buildBMPRouteMonitoring(PeerTypeLocRIB, bgp)
+	invalid[0] = 2 // wrong version — Parse will return error
+
+	combined := make([]byte, 0, len(valid1)+len(invalid)+len(valid2))
+	combined = append(combined, valid1...)
+	combined = append(combined, invalid...)
+	combined = append(combined, valid2...)
+
+	results, err := ParseAll(combined)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected 2 valid messages (skipping invalid), got %d", len(results))
+	}
+	if !results[0].IsLocRIB {
+		t.Error("expected first valid message IsLocRIB=true")
+	}
+	if results[1].IsLocRIB {
+		t.Error("expected second valid message IsLocRIB=false")
+	}
+}
+
+func TestParseAll_TrailingGarbage(t *testing.T) {
+	bgp := buildMinimalBGPUpdate()
+	valid := buildBMPRouteMonitoring(PeerTypeLocRIB, bgp)
+
+	// Append trailing garbage that is too short to form a valid BMP header.
+	garbage := []byte{0xDE, 0xAD, 0xBE, 0xEF}
+	combined := append(valid, garbage...)
+
+	results, err := ParseAll(combined)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 parsed message, got %d", len(results))
+	}
+	if !results[0].IsLocRIB {
+		t.Error("expected IsLocRIB=true for the valid message")
+	}
+}
+
+func TestParseAll_NoValidMessages(t *testing.T) {
+	// Data too short for any BMP message.
+	data := []byte{0x03, 0x00}
+
+	results, err := ParseAll(data)
+	if err == nil {
+		t.Fatal("expected error when no valid messages can be parsed")
+	}
+	if results != nil {
+		t.Errorf("expected nil results, got %d messages", len(results))
+	}
+}
+
+// --- M22. RouterIDFromPeerHeader IPv6 test ---
+
+func TestRouterIDFromPeerHeader_IPv6(t *testing.T) {
+	// Build a per-peer header with a real IPv6 address (2001:db8::1) in the
+	// Peer Address field at offset 10 (16 bytes).
+	hdr := make([]byte, PerPeerHeaderSize)
+	hdr[0] = PeerTypeGlobal
+
+	ipv6 := net.ParseIP("2001:db8::1")
+	copy(hdr[10:26], ipv6.To16())
+
+	routerID := RouterIDFromPeerHeader(hdr)
+	if routerID != "2001:db8::1" {
+		t.Errorf("expected router ID '2001:db8::1', got '%s'", routerID)
+	}
+}
+
+// --- M23. RouterIPFromOpenBMPV17 with non-zero admin ID ---
+
+func TestRouterIPFromOpenBMPV17_NonZeroAdminID(t *testing.T) {
+	// Build a mock OpenBMP v1.7 header where adminIDLen > 0.
+	// The standard buildOpenBMPV17FrameWithIP uses hdrLen=78 and adminIDLen=0,
+	// placing Router IP at offset 56. With adminIDLen=5, the Router IP moves
+	// to offset 56+5=61.
+	adminID := []byte("admin")
+	adminIDLen := len(adminID)
+	hdrLen := uint16(78 + adminIDLen)
+
+	payload := []byte{0x03} // minimal payload
+	frame := make([]byte, int(hdrLen)+len(payload))
+
+	// Header fields
+	binary.BigEndian.PutUint32(frame[0:4], 0x4F424D50) // "OBMP" magic
+	frame[4] = 1                                        // major version
+	frame[5] = 7                                        // minor version
+	binary.BigEndian.PutUint16(frame[6:8], hdrLen)
+	binary.BigEndian.PutUint32(frame[8:12], uint32(len(payload)))
+	frame[12] = 0x80 // flags
+	frame[13] = 12   // message type: BMP_RAW
+
+	// Offset 38: collector admin ID length
+	binary.BigEndian.PutUint16(frame[38:40], uint16(adminIDLen))
+	// Offset 40: collector admin ID
+	copy(frame[40:40+adminIDLen], adminID)
+
+	// Router Hash at offset 40+adminIDLen (16 bytes, zeroed)
+	// Router IP at offset 56+adminIDLen (16 bytes)
+	routerIPOffset := 56 + adminIDLen
+	// IPv4 10.20.30.40 stored in first 4 bytes of the 16-byte field.
+	frame[routerIPOffset] = 10
+	frame[routerIPOffset+1] = 20
+	frame[routerIPOffset+2] = 30
+	frame[routerIPOffset+3] = 40
+
+	// Remaining header fields (router group len, row count) at adjusted offsets.
+	routerGroupLenOffset := 72 + adminIDLen
+	binary.BigEndian.PutUint16(frame[routerGroupLenOffset:routerGroupLenOffset+2], 0)
+	binary.BigEndian.PutUint32(frame[routerGroupLenOffset+2:routerGroupLenOffset+6], 1)
+
+	copy(frame[hdrLen:], payload)
+
+	got := RouterIPFromOpenBMPV17(frame)
+	if got != "10.20.30.40" {
+		t.Errorf("expected router IP '10.20.30.40', got '%s'", got)
+	}
+}
+
+// --- M24. ParseAll truncated last message ---
+
+func TestParseAll_TruncatedLastMessage(t *testing.T) {
+	bgp := buildMinimalBGPUpdate()
+	valid := buildBMPRouteMonitoring(PeerTypeLocRIB, bgp)
+
+	// Append partial second message: only first 3 bytes of what would be a
+	// valid BMP common header (needs 6 bytes minimum).
+	partial := []byte{BMPVersion, 0x00, 0x00}
+	combined := append(valid, partial...)
+
+	results, err := ParseAll(combined)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 parsed message (truncated second skipped), got %d", len(results))
+	}
+	if !results[0].IsLocRIB {
+		t.Error("expected the valid message to have IsLocRIB=true")
+	}
+}
+
+// --- L24. Termination message ---
+
+func TestParse_TerminationMessage(t *testing.T) {
+	// Build a minimal BMP Termination message: common header only (no per-peer header).
+	totalLen := CommonHeaderSize
+	msg := make([]byte, totalLen)
+	msg[0] = BMPVersion
+	binary.BigEndian.PutUint32(msg[1:5], uint32(totalLen))
+	msg[5] = MsgTypeTermination
+
+	parsed, err := Parse(msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if parsed.MsgType != MsgTypeTermination {
+		t.Errorf("expected MsgType=%d, got %d", MsgTypeTermination, parsed.MsgType)
+	}
+}
+
+// --- H9. Peer Down Loc-RIB with TLV ---
+
+func TestParsePeerDown_LocRIB_TableNameTLV(t *testing.T) {
+	// Build a BMP Peer Down message with:
+	// - peer_type=3 (Loc-RIB)
+	// - 1 byte reason code after per-peer header
+	// - TLV with type=0 (table name), value="default"
+	tableName := "default"
+	tlv := make([]byte, 4+len(tableName))
+	binary.BigEndian.PutUint16(tlv[0:2], uint16(TLVTypeTableName))
+	binary.BigEndian.PutUint16(tlv[2:4], uint16(len(tableName)))
+	copy(tlv[4:], tableName)
+
+	// common header (6) + per-peer header (42) + reason code (1) + TLV
+	totalLen := 6 + 42 + 1 + len(tlv)
+	msg := make([]byte, totalLen)
+	msg[0] = BMPVersion
+	binary.BigEndian.PutUint32(msg[1:5], uint32(totalLen))
+	msg[5] = MsgTypePeerDown
+	msg[6] = PeerTypeLocRIB // peer_type in per-peer header
+	msg[48] = 6             // reason code byte (value doesn't matter for this test)
+	copy(msg[49:], tlv)     // TLV follows the reason code
+
+	parsed, err := Parse(msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if parsed.MsgType != MsgTypePeerDown {
+		t.Errorf("expected MsgType=%d, got %d", MsgTypePeerDown, parsed.MsgType)
+	}
+	if !parsed.IsLocRIB {
+		t.Error("expected IsLocRIB=true for Loc-RIB peer down")
+	}
+	if parsed.TableName != "default" {
+		t.Errorf("expected TableName='default', got '%s'", parsed.TableName)
 	}
 }

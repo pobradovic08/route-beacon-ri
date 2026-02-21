@@ -55,8 +55,8 @@ type RouteEvent struct {
 	Nexthop   string
 	ASPath    string
 	Origin    string
-	LocalPref *int32
-	MED       *int32
+	LocalPref *uint32
+	MED       *uint32
 	CommStd   []string
 	CommExt   []string
 	CommLarge []string

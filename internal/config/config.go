@@ -53,7 +53,9 @@ type SASLConfig struct {
 type ConsumerConfig struct {
 	GroupID string   `koanf:"group_id"`
 	Topics  []string `koanf:"topics"`
-	RawMode bool     `koanf:"raw_mode"`
+	// RawMode is only applicable to the state pipeline consumer.
+	// The history pipeline always processes raw BMP data directly.
+	RawMode bool `koanf:"raw_mode"`
 }
 
 type PostgresConfig struct {
@@ -171,6 +173,18 @@ func (c *Config) Validate() error {
 	}
 	if c.Retention.Days <= 0 {
 		return fmt.Errorf("config: retention.days must be > 0 (got %d)", c.Retention.Days)
+	}
+	if c.Ingest.MaxPayloadBytes <= 0 {
+		return fmt.Errorf("config: ingest.max_payload_bytes must be > 0 (got %d)", c.Ingest.MaxPayloadBytes)
+	}
+	if c.Kafka.FetchMaxBytes <= 0 {
+		return fmt.Errorf("config: kafka.fetch_max_bytes must be > 0 (got %d)", c.Kafka.FetchMaxBytes)
+	}
+	if c.Postgres.MaxConns <= 0 {
+		return fmt.Errorf("config: postgres.max_conns must be > 0 (got %d)", c.Postgres.MaxConns)
+	}
+	if c.Postgres.MinConns < 0 {
+		return fmt.Errorf("config: postgres.min_conns must be >= 0 (got %d)", c.Postgres.MinConns)
 	}
 	if c.Service.ShutdownTimeoutSeconds <= 0 {
 		return fmt.Errorf("config: service.shutdown_timeout_seconds must be > 0 (got %d)", c.Service.ShutdownTimeoutSeconds)

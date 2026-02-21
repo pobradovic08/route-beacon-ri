@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -165,7 +166,7 @@ func runServe() {
 
 	stateConsumer, err := kafka.NewStateConsumer(
 		cfg.Kafka.Brokers, cfg.Kafka.State.GroupID, cfg.Kafka.State.Topics,
-		cfg.Kafka.ClientID, cfg.Kafka.FetchMaxBytes, logger.Named("kafka.state"),
+		cfg.Kafka.ClientID+"-state", cfg.Kafka.FetchMaxBytes, logger.Named("kafka.state"),
 	)
 	if err != nil {
 		logger.Fatal("failed to create state consumer", zap.Error(err))
@@ -194,7 +195,7 @@ func runServe() {
 
 	historyConsumer, err := kafka.NewHistoryConsumer(
 		cfg.Kafka.Brokers, cfg.Kafka.History.GroupID, cfg.Kafka.History.Topics,
-		cfg.Kafka.ClientID, cfg.Kafka.FetchMaxBytes, logger.Named("kafka.history"),
+		cfg.Kafka.ClientID+"-history", cfg.Kafka.FetchMaxBytes, logger.Named("kafka.history"),
 	)
 	if err != nil {
 		logger.Fatal("failed to create history consumer", zap.Error(err))
@@ -298,8 +299,12 @@ func runMaintenance() {
 }
 
 func redactDSN(dsn string) string {
-	if idx := len(dsn); idx > 20 {
-		return dsn[:20] + "..."
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return "***"
 	}
-	return dsn
+	if u.User != nil {
+		u.User = url.UserPassword(u.User.Username(), "***")
+	}
+	return u.String()
 }

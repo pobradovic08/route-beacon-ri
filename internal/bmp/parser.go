@@ -74,7 +74,7 @@ func Parse(data []byte) (*ParsedBMP, error) {
 		result.MsgType = MsgTypeTermination
 		return result, nil
 	default:
-		// Skip other message types.
+		// Initiation (4), Statistics Report (1), Peer Up (3), Route Mirroring (6) — not needed for Loc-RIB ingestion.
 		return result, nil
 	}
 }
@@ -135,7 +135,20 @@ func parsePeerDown(data []byte, result *ParsedBMP) (*ParsedBMP, error) {
 	}
 
 	result.PeerType = data[0]
+	result.PeerFlags = data[1]
 	result.IsLocRIB = result.PeerType == PeerTypeLocRIB
+	result.HasAddPath = (result.PeerFlags & PeerFlagAddPath) != 0
+
+	if result.IsLocRIB {
+		// RFC 9069 Section 5: Peer Down for Loc-RIB includes a reason code
+		// byte after the per-peer header, followed by optional TLVs.
+		if len(data) > 42 {
+			// Reason code at offset 42 (first byte after per-peer header).
+			// Skip reason code, parse TLVs from remaining data.
+			tlvData := data[43:]
+			parseTLVs(tlvData, result)
+		}
+	}
 
 	return result, nil
 }

@@ -44,9 +44,12 @@ func (p *Pipeline) Run(ctx context.Context, records <-chan []*kgo.Record, flushe
 	for {
 		select {
 		case <-ctx.Done():
-			// Drain remaining.
+			// Drain remaining with a fresh context so writes are not
+			// immediately cancelled by the already-done parent context.
 			if len(batchRecords) > 0 {
-				if err := p.flush(ctx, batch, batchRecords, flushed); err != nil {
+				shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				if err := p.flush(shutdownCtx, batch, batchRecords, flushed); err != nil {
 					p.logger.Error("final flush failed", zap.Error(err))
 				}
 			}
@@ -65,17 +68,18 @@ func (p *Pipeline) Run(ctx context.Context, records <-chan []*kgo.Record, flushe
 			for _, rec := range recs {
 				routes, action := p.processRecord(ctx, rec)
 
-				// Always track the record for offset commit, even if parsing
-				// failed or the message was filtered. This prevents unparseable
-				// records from stalling partition progress.
-				batchRecords = append(batchRecords, rec)
-
 				if len(routes) == 0 {
+					// Always track the record for offset commit, even if
+					// parsing failed or the message was filtered. This
+					// prevents unparseable records from stalling partition
+					// progress.
+					batchRecords = append(batchRecords, rec)
 					continue
 				}
 
 				switch action {
 				case actionRoute:
+					batchRecords = append(batchRecords, rec)
 					batch = append(batch, routes...)
 				case actionEOR:
 					// A raw record may contain both regular routes and
@@ -93,14 +97,21 @@ func (p *Pipeline) Run(ctx context.Context, records <-chan []*kgo.Record, flushe
 						}
 						batch = nil
 					}
+					eorFailed := false
 					for _, r := range routes {
 						if !r.IsEOR {
 							continue
 						}
 						if err := p.writer.HandleEOR(ctx, r.RouterID, r.TableName, r.AFI); err != nil {
 							p.logger.Error("EOR handling failed", zap.Error(err))
+							eorFailed = true
 						}
 					}
+					// Only commit offsets if all EOR handlers succeeded.
+					if eorFailed {
+						continue
+					}
+					batchRecords = append(batchRecords, rec)
 					if len(batchRecords) > 0 {
 						select {
 						case flushed <- batchRecords:
@@ -110,7 +121,11 @@ func (p *Pipeline) Run(ctx context.Context, records <-chan []*kgo.Record, flushe
 					}
 				case actionPeerDown:
 					// Flush pending routes to DB before session termination.
-					// If flush fails, keep batch for retry and skip termination.
+					// If flush fails, keep batch for retry and skip termination
+					// so the record is re-consumed on next restart. This means
+					// the PeerDown event may be replayed, which is safe because
+					// HandleSessionTermination is idempotent (DELETE is a no-op
+					// for already-removed rows).
 					if len(batch) > 0 {
 						if err := p.writer.FlushBatch(ctx, batch); err != nil {
 							p.logger.Error("pre-peerdown flush failed", zap.Error(err))
@@ -118,15 +133,18 @@ func (p *Pipeline) Run(ctx context.Context, records <-chan []*kgo.Record, flushe
 						}
 						batch = nil
 					}
-					if err := p.writer.HandleSessionTermination(ctx, routes[0].RouterID); err != nil {
+					if err := p.writer.HandleSessionTermination(ctx, routes[0].RouterID, routes[0].TableName); err != nil {
 						p.logger.Error("session termination failed", zap.Error(err))
-					} else if len(batchRecords) > 0 {
-						// Session termination succeeded — now safe to commit offsets.
-						select {
-						case flushed <- batchRecords:
-						case <-ctx.Done():
+					} else {
+						batchRecords = append(batchRecords, rec)
+						if len(batchRecords) > 0 {
+							// Session termination succeeded — now safe to commit offsets.
+							select {
+							case flushed <- batchRecords:
+							case <-ctx.Done():
+							}
+							batchRecords = nil
 						}
-						batchRecords = nil
 					}
 				}
 			}
@@ -230,9 +248,25 @@ func (p *Pipeline) processPeerRecord(ctx context.Context, rec *kgo.Record) ([]*P
 		return nil, actionRoute
 	}
 
-	if pe.Action == "peer_down" && pe.IsLocRIB {
+	if !pe.IsLocRIB {
+		return nil, actionRoute
+	}
+
+	if pe.Action == "peer_up" {
+		metrics.KafkaMessagesTotal.WithLabelValues("state", rec.Topic, "", "peer_up").Inc()
+		if err := p.writer.UpdateSessionStart(ctx, pe.RouterID, pe.TableName, 0); err != nil {
+			p.logger.Error("UpdateSessionStart failed",
+				zap.String("router_id", pe.RouterID),
+				zap.String("table_name", pe.TableName),
+				zap.Error(err),
+			)
+		}
+		return nil, actionRoute
+	}
+
+	if pe.Action == "peer_down" {
 		metrics.KafkaMessagesTotal.WithLabelValues("state", rec.Topic, "", "peer_down").Inc()
-		return []*ParsedRoute{{RouterID: pe.RouterID}}, actionPeerDown
+		return []*ParsedRoute{{RouterID: pe.RouterID, TableName: pe.TableName}}, actionPeerDown
 	}
 
 	return nil, actionRoute
@@ -284,9 +318,23 @@ func (p *Pipeline) processRawRecord(ctx context.Context, rec *kgo.Record) ([]*Pa
 			}
 		}
 
+		if parsed.MsgType == bmp.MsgTypePeerUp {
+			metrics.KafkaMessagesTotal.WithLabelValues("state", rec.Topic, "", "peer_up").Inc()
+			if err := p.writer.UpdateSessionStart(ctx, routerID, parsed.TableName, 0); err != nil {
+				p.logger.Error("UpdateSessionStart failed",
+					zap.String("router_id", routerID),
+					zap.String("table_name", parsed.TableName),
+					zap.Error(err),
+				)
+			}
+			continue
+		}
+
 		if parsed.MsgType == bmp.MsgTypePeerDown {
 			metrics.KafkaMessagesTotal.WithLabelValues("state", rec.Topic, "", "peer_down").Inc()
-			return []*ParsedRoute{{RouterID: routerID}}, actionPeerDown
+			finalAction = actionPeerDown
+			routes = append(routes, &ParsedRoute{RouterID: routerID, TableName: parsed.TableName})
+			break
 		}
 
 		if parsed.MsgType != bmp.MsgTypeRouteMonitoring || parsed.BGPData == nil {

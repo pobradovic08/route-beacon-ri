@@ -3,11 +3,15 @@ package maintenance
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 )
+
+var validPartitionName = regexp.MustCompile(`^route_events_\d{8}$`)
 
 type PartitionManager struct {
 	pool          *pgxpool.Pool
@@ -43,7 +47,7 @@ func (pm *PartitionManager) CreatePartitions(ctx context.Context) error {
 	}
 
 	now := time.Now().In(loc)
-	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
 	tomorrow := today.AddDate(0, 0, 1)
 	dayAfter := today.AddDate(0, 0, 2)
 
@@ -58,12 +62,13 @@ func (pm *PartitionManager) CreatePartitions(ctx context.Context) error {
 
 func (pm *PartitionManager) createPartition(ctx context.Context, from, to time.Time) error {
 	name := fmt.Sprintf("route_events_%s", from.Format("20060102"))
+	safeName := pgx.Identifier{name}.Sanitize()
 	fromStr := from.Format("2006-01-02 15:04:05+00")
 	toStr := to.Format("2006-01-02 15:04:05+00")
 
 	createSQL := fmt.Sprintf(
 		`CREATE TABLE IF NOT EXISTS %s PARTITION OF route_events FOR VALUES FROM ('%s') TO ('%s')`,
-		name, fromStr, toStr,
+		safeName, fromStr, toStr,
 	)
 
 	if _, err := pm.pool.Exec(ctx, createSQL); err != nil {
@@ -71,14 +76,14 @@ func (pm *PartitionManager) createPartition(ctx context.Context, from, to time.T
 	}
 	pm.logger.Info("partition ensured", zap.String("partition", name))
 
-	// Create per-partition indexes.
+	// Create per-partition indexes using sanitized name.
 	prefixIdx := fmt.Sprintf(
 		`CREATE INDEX IF NOT EXISTS idx_%s_prefix_history ON %s (router_id, table_name, afi, prefix, ingest_time DESC)`,
-		name, name,
+		name, safeName,
 	)
 	churnIdx := fmt.Sprintf(
 		`CREATE INDEX IF NOT EXISTS idx_%s_router_churn ON %s (router_id, table_name, afi, ingest_time DESC)`,
-		name, name,
+		name, safeName,
 	)
 
 	if _, err := pm.pool.Exec(ctx, prefixIdx); err != nil {
@@ -100,7 +105,7 @@ func (pm *PartitionManager) DropOldPartitions(ctx context.Context) error {
 
 	// Cutoff: retention_days ago in the configured timezone, then converted to a date.
 	cutoff := time.Now().In(loc).AddDate(0, 0, -pm.retentionDays)
-	cutoffDate := time.Date(cutoff.Year(), cutoff.Month(), cutoff.Day(), 0, 0, 0, 0, time.UTC)
+	cutoffDate := time.Date(cutoff.Year(), cutoff.Month(), cutoff.Day(), 0, 0, 0, 0, loc)
 
 	// List existing partitions of route_events.
 	rows, err := pm.pool.Query(ctx,
@@ -123,10 +128,12 @@ func (pm *PartitionManager) DropOldPartitions(ctx context.Context) error {
 	}
 
 	for _, name := range partitions {
-		// Parse date from partition name: route_events_YYYYMMDD
-		if len(name) < 8 {
+		if !validPartitionName.MatchString(name) {
+			pm.logger.Warn("skipping partition with unexpected name", zap.String("partition", name))
 			continue
 		}
+
+		// Parse date from partition name: route_events_YYYYMMDD
 		dateStr := name[len(name)-8:]
 		partDate, err := time.Parse("20060102", dateStr)
 		if err != nil {
@@ -135,7 +142,8 @@ func (pm *PartitionManager) DropOldPartitions(ctx context.Context) error {
 		}
 
 		if partDate.Before(cutoffDate) {
-			dropSQL := fmt.Sprintf("DROP TABLE IF EXISTS %s", name)
+			safeName := pgx.Identifier{name}.Sanitize()
+			dropSQL := fmt.Sprintf("DROP TABLE IF EXISTS %s", safeName)
 			if _, err := pm.pool.Exec(ctx, dropSQL); err != nil {
 				return fmt.Errorf("dropping partition %s: %w", name, err)
 			}

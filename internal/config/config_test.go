@@ -15,9 +15,10 @@ func validConfig() *Config {
 			ShutdownTimeoutSeconds: 30,
 		},
 		Kafka: KafkaConfig{
-			Brokers: []string{"localhost:9092"},
-			State:   ConsumerConfig{GroupID: "g1", Topics: []string{"t1"}},
-			History: ConsumerConfig{GroupID: "g2", Topics: []string{"t2"}},
+			Brokers:       []string{"localhost:9092"},
+			FetchMaxBytes: 52428800,
+			State:         ConsumerConfig{GroupID: "g1", Topics: []string{"t1"}},
+			History:       ConsumerConfig{GroupID: "g2", Topics: []string{"t2"}},
 		},
 		Postgres: PostgresConfig{
 			DSN:      "postgres://localhost/test",
