@@ -182,6 +182,8 @@ func hasInvalidPrefixes(events []*RouteEvent) bool {
 // DetectEORAFI determines the address family for an End-of-RIB marker.
 // It scans the BGP UPDATE's path attributes for MP_UNREACH_NLRI.
 // If found with AFI=2 (IPv6), returns 6. Otherwise returns 4 (IPv4).
+// Only IPv4 (AFI=1) and IPv6 (AFI=2) unicast are supported. IPv4 EOR
+// is an empty UPDATE (no MP_UNREACH), so the default return of 4 is correct.
 // Only call this when ParseUpdate returned 0 events and no error.
 func DetectEORAFI(data []byte) int {
 	if len(data) < BGPHeaderSize+4 {
@@ -241,7 +243,7 @@ func DetectEORAFI(data []byte) int {
 			break
 		}
 
-		if typeCode == AttrTypeMPUnreachNLRI && attrLen >= 2 {
+		if typeCode == AttrTypeMPUnreachNLRI && attrLen >= 3 {
 			afi := binary.BigEndian.Uint16(payload[offset : offset+2])
 			if afi == AFIIPv6 {
 				return 6
@@ -252,37 +254,4 @@ func DetectEORAFI(data []byte) int {
 	}
 
 	return 4
-}
-
-func parsePrefixesV4(data []byte, hasAddPath bool) []PrefixInfo {
-	var prefixes []PrefixInfo
-	offset := 0
-	for offset < len(data) {
-		var pathID int64
-		if hasAddPath {
-			if offset+4 > len(data) {
-				break
-			}
-			pathID = int64(binary.BigEndian.Uint32(data[offset : offset+4]))
-			offset += 4
-		}
-		if offset >= len(data) {
-			break
-		}
-		prefixLen := int(data[offset])
-		offset++
-		byteLen := (prefixLen + 7) / 8
-		if offset+byteLen > len(data) {
-			break
-		}
-		ipBytes := make([]byte, 4)
-		copy(ipBytes, data[offset:offset+byteLen])
-		offset += byteLen
-		ip := net.IP(ipBytes)
-		prefixes = append(prefixes, PrefixInfo{
-			Prefix: fmt.Sprintf("%s/%d", ip.String(), prefixLen),
-			PathID: pathID,
-		})
-	}
-	return prefixes
 }

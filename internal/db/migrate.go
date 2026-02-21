@@ -20,6 +20,13 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 );`
 
 func RunMigrations(ctx context.Context, pool *pgxpool.Pool, migrationsDir string, logger *zap.Logger) error {
+	// Acquire advisory lock to prevent concurrent migrations.
+	const migrationLockID int64 = 0x726962696E676573 // "ribinges" as int64
+	if _, err := pool.Exec(ctx, "SELECT pg_advisory_lock($1)", migrationLockID); err != nil {
+		return fmt.Errorf("acquiring migration lock: %w", err)
+	}
+	defer pool.Exec(ctx, "SELECT pg_advisory_unlock($1)", migrationLockID)
+
 	// Ensure the schema_migrations table exists.
 	if _, err := pool.Exec(ctx, createMigrationsTable); err != nil {
 		return fmt.Errorf("creating schema_migrations table: %w", err)

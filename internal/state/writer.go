@@ -194,7 +194,9 @@ func (w *Writer) HandleEOR(ctx context.Context, routerID, tableName string, afi 
 }
 
 // HandleSessionTermination purges all routes and sync status for a disconnected router.
-func (w *Writer) HandleSessionTermination(ctx context.Context, routerID string) error {
+// When tableName is non-empty, only the specific table is purged; otherwise all tables
+// for the router are removed (legacy fallback).
+func (w *Writer) HandleSessionTermination(ctx context.Context, routerID, tableName string) error {
 	start := time.Now()
 
 	tx, err := w.pool.Begin(ctx)
@@ -203,17 +205,31 @@ func (w *Writer) HandleSessionTermination(ctx context.Context, routerID string) 
 	}
 	defer tx.Rollback(ctx)
 
-	// Purge all current routes for the router.
-	tag, err := tx.Exec(ctx, `DELETE FROM current_routes WHERE router_id = $1`, routerID)
-	if err != nil {
-		return fmt.Errorf("purge routes for router %s: %w", routerID, err)
-	}
-	purged := tag.RowsAffected()
+	var purged int64
+	if tableName != "" {
+		// Scoped: purge only the specific table.
+		tag, err := tx.Exec(ctx, `DELETE FROM current_routes WHERE router_id = $1 AND table_name = $2`, routerID, tableName)
+		if err != nil {
+			return fmt.Errorf("purge routes for router %s table %s: %w", routerID, tableName, err)
+		}
+		purged = tag.RowsAffected()
 
-	// Delete/reset rib_sync_status rows for the router.
-	_, err = tx.Exec(ctx, `DELETE FROM rib_sync_status WHERE router_id = $1`, routerID)
-	if err != nil {
-		return fmt.Errorf("delete sync status for router %s: %w", routerID, err)
+		_, err = tx.Exec(ctx, `DELETE FROM rib_sync_status WHERE router_id = $1 AND table_name = $2`, routerID, tableName)
+		if err != nil {
+			return fmt.Errorf("delete sync status for router %s table %s: %w", routerID, tableName, err)
+		}
+	} else {
+		// Fallback: purge all tables for the router.
+		tag, err := tx.Exec(ctx, `DELETE FROM current_routes WHERE router_id = $1`, routerID)
+		if err != nil {
+			return fmt.Errorf("purge routes for router %s: %w", routerID, err)
+		}
+		purged = tag.RowsAffected()
+
+		_, err = tx.Exec(ctx, `DELETE FROM rib_sync_status WHERE router_id = $1`, routerID)
+		if err != nil {
+			return fmt.Errorf("delete sync status for router %s: %w", routerID, err)
+		}
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -228,6 +244,7 @@ func (w *Writer) HandleSessionTermination(ctx context.Context, routerID string) 
 
 	w.logger.Info("purged routes on session termination",
 		zap.String("router_id", routerID),
+		zap.String("table_name", tableName),
 		zap.Int64("purged", purged),
 	)
 

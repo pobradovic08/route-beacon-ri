@@ -128,7 +128,8 @@ func RouterIPFromOpenBMPV17(data []byte) string {
 
 	ipBytes := data[routerIPOffset : routerIPOffset+16]
 
-	// Check if it's an IPv4 address (first 4 bytes used, rest zero).
+	// IPv4 is stored in the first 4 bytes of the 16-byte field. This matches
+	// goBMP's v1.7 binary format specifically (not RFC 7854's last-4-bytes convention).
 	allZero := true
 	for _, b := range ipBytes[4:] {
 		if b != 0 {

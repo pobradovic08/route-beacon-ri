@@ -753,3 +753,364 @@ func TestParseUpdateAutoDetect_RealDefaultRoute(t *testing.T) {
 		t.Errorf("expected prefix '0.0.0.0/0', got '%s'", events[0].Prefix)
 	}
 }
+
+// --- H10-H15, H18 tests ---
+
+func TestParseUpdate_NonUpdateMessageType(t *testing.T) {
+	// Build a BGP message with type=4 (KEEPALIVE) instead of type=2 (UPDATE).
+	msg := make([]byte, 19)
+	for i := 0; i < 16; i++ {
+		msg[i] = 0xFF
+	}
+	binary.BigEndian.PutUint16(msg[16:18], 19)
+	msg[18] = 4 // KEEPALIVE
+
+	events, err := ParseUpdate(msg, false)
+	if err != nil {
+		t.Fatalf("expected no error for non-UPDATE type, got: %v", err)
+	}
+	if events != nil {
+		t.Errorf("expected nil events for non-UPDATE type, got %d events", len(events))
+	}
+}
+
+func TestParseUpdate_TooShort(t *testing.T) {
+	// Pass data shorter than 19 bytes (BGPHeaderSize).
+	data := []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}
+	_, err := ParseUpdate(data, false)
+	if err == nil {
+		t.Fatal("expected error for data shorter than BGP header size")
+	}
+}
+
+func TestParseUpdatePayload_TruncatedPayload(t *testing.T) {
+	// Build a valid BGP UPDATE header but with payload less than 4 bytes.
+	// The UPDATE header is 19 bytes, then we need at least 4 bytes for
+	// withdrawn_len(2) + path_attr_len(2). Provide only 2.
+	totalLen := 19 + 2
+	msg := make([]byte, totalLen)
+	for i := 0; i < 16; i++ {
+		msg[i] = 0xFF
+	}
+	binary.BigEndian.PutUint16(msg[16:18], uint16(totalLen))
+	msg[18] = 2 // type = UPDATE
+	// Payload: only 2 bytes of zeros (withdrawn_len=0, but no room for path_attr_len).
+	msg[19] = 0
+	msg[20] = 0
+
+	_, err := ParseUpdate(msg, false)
+	if err == nil {
+		t.Fatal("expected error for truncated payload (less than 4 bytes)")
+	}
+}
+
+func TestParseUpdate_IPv4AddPathWithdrawals(t *testing.T) {
+	// Build a BGP UPDATE with withdrawn routes that include Add-Path path IDs.
+	// Withdrawn: path_id=10, 10.0.0.0/24 + path_id=20, 172.16.0.0/16
+	withdrawn := []byte{
+		0, 0, 0, 10, // path_id=10
+		24, 10, 0, 0, // 10.0.0.0/24
+		0, 0, 0, 20, // path_id=20
+		16, 172, 16, // 172.16.0.0/16
+	}
+
+	msg := buildBGPUpdate(withdrawn, nil, nil)
+
+	events, err := ParseUpdate(msg, true) // hasAddPath=true
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events, got %d", len(events))
+	}
+
+	// First withdrawal.
+	if events[0].Action != "D" {
+		t.Errorf("event[0]: expected action 'D', got '%s'", events[0].Action)
+	}
+	if events[0].Prefix != "10.0.0.0/24" {
+		t.Errorf("event[0]: expected prefix '10.0.0.0/24', got '%s'", events[0].Prefix)
+	}
+	if events[0].PathID != 10 {
+		t.Errorf("event[0]: expected PathID=10, got %d", events[0].PathID)
+	}
+
+	// Second withdrawal.
+	if events[1].Action != "D" {
+		t.Errorf("event[1]: expected action 'D', got '%s'", events[1].Action)
+	}
+	if events[1].Prefix != "172.16.0.0/16" {
+		t.Errorf("event[1]: expected prefix '172.16.0.0/16', got '%s'", events[1].Prefix)
+	}
+	if events[1].PathID != 20 {
+		t.Errorf("event[1]: expected PathID=20, got %d", events[1].PathID)
+	}
+}
+
+func TestParseUpdateAutoDetect_InitialParseError(t *testing.T) {
+	// Pass truncated/corrupt data that causes ParseUpdate to return an error.
+	// 19-byte header with type=2 but only 1 byte of payload (need at least 4).
+	totalLen := 20
+	data := make([]byte, totalLen)
+	for i := 0; i < 16; i++ {
+		data[i] = 0xFF
+	}
+	binary.BigEndian.PutUint16(data[16:18], uint16(totalLen))
+	data[18] = 2 // UPDATE
+	data[19] = 0 // only 1 byte of payload
+
+	events, hasAddPath, err := ParseUpdateAutoDetect(data, false)
+	if err == nil {
+		t.Fatal("expected error for truncated data")
+	}
+	// hasAddPath should match the original input (false).
+	if hasAddPath != false {
+		t.Errorf("expected hasAddPath=false, got %v", hasAddPath)
+	}
+	// events may be nil or empty; just verify the error was propagated.
+	_ = events
+}
+
+func TestParseASPath_ASSet(t *testing.T) {
+	// AS_PATH: AS_SEQUENCE [64496] + AS_SET {64497, 64498}
+	asPathData := []byte{
+		ASPathSegmentSequence, 1, // type=SEQUENCE, count=1
+		0, 0, 0xFB, 0xF0, // AS64496
+		ASPathSegmentSet, 2, // type=SET, count=2
+		0, 0, 0xFB, 0xF1, // AS64497
+		0, 0, 0xFB, 0xF2, // AS64498
+	}
+	asPathAttr := buildPathAttr(0x40, AttrTypeASPath, asPathData)
+
+	nlri := []byte{24, 10, 0, 0}
+	originAttr := buildPathAttr(0x40, AttrTypeOrigin, []byte{0})
+	nexthopAttr := buildPathAttr(0x40, AttrTypeNextHop, []byte{192, 168, 1, 1})
+	pathAttrs := append(originAttr, append(asPathAttr, nexthopAttr...)...)
+
+	msg := buildBGPUpdate(nil, pathAttrs, nlri)
+
+	events, err := ParseUpdate(msg, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+
+	expected := "64496 {64497,64498}"
+	if events[0].ASPath != expected {
+		t.Errorf("expected AS_PATH '%s', got '%s'", expected, events[0].ASPath)
+	}
+}
+
+// --- BGP attribute tests ---
+
+func TestParseExtCommunities(t *testing.T) {
+	// Extended community: 2 communities, each 8 bytes.
+	extCommData := []byte{
+		0x00, 0x02, 0xFB, 0xF0, 0x00, 0x00, 0x00, 0x64, // Route Target 64496:100
+		0x00, 0x02, 0xFB, 0xF0, 0x00, 0x00, 0x00, 0xC8, // Route Target 64496:200
+	}
+	extCommAttr := buildPathAttr(0xC0, AttrTypeExtCommunity, extCommData)
+
+	nlri := []byte{24, 10, 0, 0}
+	originAttr := buildPathAttr(0x40, AttrTypeOrigin, []byte{0})
+	nexthopAttr := buildPathAttr(0x40, AttrTypeNextHop, []byte{192, 168, 1, 1})
+	pathAttrs := append(originAttr, append(extCommAttr, nexthopAttr...)...)
+
+	msg := buildBGPUpdate(nil, pathAttrs, nlri)
+
+	events, err := ParseUpdate(msg, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+
+	ev := events[0]
+	if len(ev.CommExt) != 2 {
+		t.Fatalf("expected 2 extended communities, got %d", len(ev.CommExt))
+	}
+	// Each 8-byte community should be hex-encoded.
+	if ev.CommExt[0] != "0002fbf000000064" {
+		t.Errorf("expected CommExt[0]='0002fbf000000064', got '%s'", ev.CommExt[0])
+	}
+	if ev.CommExt[1] != "0002fbf0000000c8" {
+		t.Errorf("expected CommExt[1]='0002fbf0000000c8', got '%s'", ev.CommExt[1])
+	}
+}
+
+func TestMPReachNLRI_DualNexthop(t *testing.T) {
+	// MP_REACH_NLRI with 32-byte next-hop: global + link-local IPv6.
+	// Global: 2001:db8::1, Link-local: fe80::1
+	global := []byte{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}
+	linkLocal := []byte{0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}
+
+	mpReach := make([]byte, 0, 64)
+	mpReach = append(mpReach, 0, 2) // AFI=2 (IPv6)
+	mpReach = append(mpReach, 1)    // SAFI=1 (unicast)
+	mpReach = append(mpReach, 32)   // NH len = 32 (global + link-local)
+	mpReach = append(mpReach, global...)
+	mpReach = append(mpReach, linkLocal...)
+	mpReach = append(mpReach, 0)                          // SNPA count
+	mpReach = append(mpReach, 32)                          // prefix len = /32
+	mpReach = append(mpReach, 0x20, 0x01, 0x0d, 0xb8) // 4 bytes of prefix
+
+	mpReachAttr := buildPathAttr(0x80, AttrTypeMPReachNLRI, mpReach)
+	originAttr := buildPathAttr(0x40, AttrTypeOrigin, []byte{0})
+	pathAttrs := append(originAttr, mpReachAttr...)
+
+	msg := buildBGPUpdate(nil, pathAttrs, nil)
+
+	events, err := ParseUpdate(msg, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+
+	// Should use global address (first 16 bytes), not link-local.
+	if events[0].Nexthop != "2001:db8::1" {
+		t.Errorf("expected nexthop '2001:db8::1', got '%s'", events[0].Nexthop)
+	}
+}
+
+func TestMPReachNLRI_IPv4Nexthop(t *testing.T) {
+	// MP_REACH_NLRI with 4-byte next-hop (IPv4 over MP).
+	mpReach := make([]byte, 0, 32)
+	mpReach = append(mpReach, 0, 1)          // AFI=1 (IPv4)
+	mpReach = append(mpReach, 1)              // SAFI=1 (unicast)
+	mpReach = append(mpReach, 4)              // NH len = 4
+	mpReach = append(mpReach, 10, 0, 0, 1)   // NH = 10.0.0.1
+	mpReach = append(mpReach, 0)              // SNPA count
+	mpReach = append(mpReach, 24, 10, 1, 0)  // 10.1.0.0/24
+
+	mpReachAttr := buildPathAttr(0x80, AttrTypeMPReachNLRI, mpReach)
+	originAttr := buildPathAttr(0x40, AttrTypeOrigin, []byte{0})
+	pathAttrs := append(originAttr, mpReachAttr...)
+
+	msg := buildBGPUpdate(nil, pathAttrs, nil)
+
+	events, err := ParseUpdate(msg, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+
+	if events[0].Nexthop != "10.0.0.1" {
+		t.Errorf("expected nexthop '10.0.0.1', got '%s'", events[0].Nexthop)
+	}
+	if events[0].Prefix != "10.1.0.0/24" {
+		t.Errorf("expected prefix '10.1.0.0/24', got '%s'", events[0].Prefix)
+	}
+}
+
+func TestParseASPath_TruncatedSegment(t *testing.T) {
+	// AS_PATH where segment header claims 3 ASNs but data only contains 2.
+	// The parser should parse what's available and stop gracefully.
+	asPathData := []byte{
+		ASPathSegmentSequence, 3, // type=SEQUENCE, count=3
+		0, 0, 0xFB, 0xF0, // AS64496
+		0, 0, 0xFB, 0xF1, // AS64497
+		// Missing third ASN — only 8 bytes of ASN data instead of required 12.
+	}
+	asPathAttr := buildPathAttr(0x40, AttrTypeASPath, asPathData)
+
+	nlri := []byte{24, 10, 0, 0}
+	originAttr := buildPathAttr(0x40, AttrTypeOrigin, []byte{0})
+	nexthopAttr := buildPathAttr(0x40, AttrTypeNextHop, []byte{192, 168, 1, 1})
+	pathAttrs := append(originAttr, append(asPathAttr, nexthopAttr...)...)
+
+	msg := buildBGPUpdate(nil, pathAttrs, nlri)
+
+	events, err := ParseUpdate(msg, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+
+	// The parser should break out of the segment when data runs out.
+	// With segLen*4=12 > len(data)-offset, the parseASPath loop breaks
+	// before parsing any ASNs in this segment, resulting in an empty AS_PATH.
+	// This is graceful handling — no crash, no error.
+	_ = events[0].ASPath // verify it doesn't crash; exact value depends on impl
+}
+
+func TestParseOrigin_EGP(t *testing.T) {
+	originAttr := buildPathAttr(0x40, AttrTypeOrigin, []byte{1}) // EGP
+	nexthopAttr := buildPathAttr(0x40, AttrTypeNextHop, []byte{192, 168, 1, 1})
+	pathAttrs := append(originAttr, nexthopAttr...)
+	nlri := []byte{24, 10, 0, 0}
+
+	msg := buildBGPUpdate(nil, pathAttrs, nlri)
+
+	events, err := ParseUpdate(msg, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	if events[0].Origin != "EGP" {
+		t.Errorf("expected origin 'EGP', got '%s'", events[0].Origin)
+	}
+}
+
+func TestParseOrigin_INCOMPLETE(t *testing.T) {
+	originAttr := buildPathAttr(0x40, AttrTypeOrigin, []byte{2}) // INCOMPLETE
+	nexthopAttr := buildPathAttr(0x40, AttrTypeNextHop, []byte{192, 168, 1, 1})
+	pathAttrs := append(originAttr, nexthopAttr...)
+	nlri := []byte{24, 10, 0, 0}
+
+	msg := buildBGPUpdate(nil, pathAttrs, nlri)
+
+	events, err := ParseUpdate(msg, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	if events[0].Origin != "INCOMPLETE" {
+		t.Errorf("expected origin 'INCOMPLETE', got '%s'", events[0].Origin)
+	}
+}
+
+func TestParseCommunity_NonMultipleOf4(t *testing.T) {
+	// Community data is 6 bytes — not a multiple of 4.
+	// Should parse the first complete 4-byte community and ignore the trailing 2 bytes.
+	commData := []byte{
+		0xFB, 0xF0, 0x00, 0x64, // 64496:100 (4 bytes)
+		0xAA, 0xBB, // trailing 2 bytes (incomplete community)
+	}
+	commAttr := buildPathAttr(0xC0, AttrTypeCommunity, commData)
+
+	nlri := []byte{24, 10, 0, 0}
+	originAttr := buildPathAttr(0x40, AttrTypeOrigin, []byte{0})
+	nexthopAttr := buildPathAttr(0x40, AttrTypeNextHop, []byte{192, 168, 1, 1})
+	pathAttrs := append(originAttr, append(commAttr, nexthopAttr...)...)
+
+	msg := buildBGPUpdate(nil, pathAttrs, nlri)
+
+	events, err := ParseUpdate(msg, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+
+	ev := events[0]
+	if len(ev.CommStd) != 1 {
+		t.Fatalf("expected 1 community (ignoring incomplete trailing bytes), got %d", len(ev.CommStd))
+	}
+	if ev.CommStd[0] != "64496:100" {
+		t.Errorf("expected '64496:100', got '%s'", ev.CommStd[0])
+	}
+}

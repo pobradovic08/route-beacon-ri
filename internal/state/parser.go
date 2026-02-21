@@ -20,8 +20,8 @@ type ParsedRoute struct {
 	Nexthop    string
 	ASPath     string
 	Origin     string
-	LocalPref  *int32
-	MED        *int32
+	LocalPref  *uint32
+	MED        *uint32
 	CommStd    []string
 	CommExt    []string
 	CommLarge  []string
@@ -30,9 +30,10 @@ type ParsedRoute struct {
 
 // PeerEvent represents a decoded goBMP peer topic message for session lifecycle.
 type PeerEvent struct {
-	RouterID string
-	Action   string // "peer_down", "peer_up"
-	IsLocRIB bool
+	RouterID  string
+	Action    string // "peer_down", "peer_up"
+	IsLocRIB  bool
+	TableName string
 }
 
 // DecodeUnicastPrefix decodes a goBMP parsed unicast prefix JSON message.
@@ -118,11 +119,11 @@ func DecodeUnicastPrefix(data []byte, topicAFI int) (*ParsedRoute, error) {
 	r.Origin = stringField(raw, "origin")
 
 	if lp, ok := raw["local_pref"]; ok {
-		v := int32(int64Field(lp))
+		v := uint32(int64Field(lp))
 		r.LocalPref = &v
 	}
 	if med, ok := raw["med"]; ok {
-		v := int32(int64Field(med))
+		v := uint32(int64Field(med))
 		r.MED = &v
 	}
 
@@ -166,6 +167,9 @@ func DecodePeerMessage(data []byte) (*PeerEvent, error) {
 
 	// Loc-RIB check
 	pe.IsLocRIB = boolField(raw, "is_loc_rib")
+
+	// Table name (may be empty for pre-v1.1.0 goBMP)
+	pe.TableName = stringField(raw, "table_name")
 
 	return pe, nil
 }
@@ -300,14 +304,14 @@ func mergeBaseAttrs(raw map[string]any, r *ParsedRoute) {
 
 	if r.LocalPref == nil {
 		if lp, ok := baseAttrs["local_pref"]; ok {
-			v := int32(int64Field(lp))
+			v := uint32(int64Field(lp))
 			r.LocalPref = &v
 		}
 	}
 
 	if r.MED == nil {
 		if med, ok := baseAttrs["med"]; ok {
-			v := int32(int64Field(med))
+			v := uint32(int64Field(med))
 			r.MED = &v
 		}
 	}

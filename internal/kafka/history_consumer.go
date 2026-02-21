@@ -3,6 +3,7 @@ package kafka
 import (
 	"context"
 	"sync/atomic"
+	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
 	"go.uber.org/zap"
@@ -28,9 +29,16 @@ func NewHistoryConsumer(brokers []string, groupID string, topics []string, clien
 			hc.joined.Store(true)
 			logger.Info("history consumer: partitions assigned")
 		}),
-		kgo.OnPartitionsRevoked(func(_ context.Context, _ *kgo.Client, _ map[string][]int32) {
+		kgo.OnPartitionsRevoked(func(ctx context.Context, cl *kgo.Client, _ map[string][]int32) {
+			if err := cl.CommitMarkedOffsets(ctx); err != nil {
+				logger.Error("history consumer: commit on revoke failed", zap.Error(err))
+			}
 			hc.joined.Store(false)
 			logger.Info("history consumer: partitions revoked")
+		}),
+		kgo.OnPartitionsLost(func(_ context.Context, _ *kgo.Client, _ map[string][]int32) {
+			hc.joined.Store(false)
+			logger.Info("history consumer: partitions lost")
 		}),
 	}
 
@@ -46,22 +54,17 @@ func NewHistoryConsumer(brokers []string, groupID string, topics []string, clien
 // Run fetches records and sends them to the records channel.
 func (hc *HistoryConsumer) Run(ctx context.Context, records chan<- []*kgo.Record, flushed <-chan []*kgo.Record) {
 	// Start a goroutine to handle offset commits.
+	// Drains the flushed channel completely before exiting.
 	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case recs, ok := <-flushed:
-				if !ok {
-					return
-				}
-				for _, r := range recs {
-					hc.client.MarkCommitRecords(r)
-				}
-				if err := hc.client.CommitMarkedOffsets(ctx); err != nil {
-					hc.logger.Error("history consumer: commit offsets failed", zap.Error(err))
-				}
+		for recs := range flushed {
+			for _, r := range recs {
+				hc.client.MarkCommitRecords(r)
 			}
+			commitCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if err := hc.client.CommitMarkedOffsets(commitCtx); err != nil {
+				hc.logger.Error("history consumer: commit offsets failed", zap.Error(err))
+			}
+			cancel()
 		}
 	}()
 

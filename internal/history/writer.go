@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/klauspost/compress/zstd"
 	"github.com/route-beacon/rib-ingester/internal/bgp"
@@ -13,7 +14,15 @@ import (
 	"go.uber.org/zap"
 )
 
-var zstdEncoder, _ = zstd.NewWriter(nil)
+var zstdEncoder *zstd.Encoder
+
+func init() {
+	var err error
+	zstdEncoder, err = zstd.NewWriter(nil)
+	if err != nil {
+		panic(fmt.Sprintf("history: zstd encoder init: %v", err))
+	}
+}
 
 type Writer struct {
 	pool           *pgxpool.Pool
@@ -56,8 +65,14 @@ func (w *Writer) FlushBatch(ctx context.Context, rows []*HistoryRow) (int64, err
 	}
 	defer tx.Rollback(ctx)
 
-	var totalInserted int64
+	const insertSQL = `
+		INSERT INTO route_events (event_id, ingest_time, router_id, table_name, afi,
+			prefix, path_id, action, nexthop, as_path, origin, localpref, med,
+			communities_std, communities_ext, communities_large, attrs, bmp_raw)
+		VALUES ($1, date_trunc('day', now()), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+		ON CONFLICT (event_id, ingest_time) DO NOTHING`
 
+	batch := &pgx.Batch{}
 	for _, row := range rows {
 		var attrsJSON []byte
 		if len(row.Event.Attrs) > 0 {
@@ -73,12 +88,7 @@ func (w *Writer) FlushBatch(ctx context.Context, rows []*HistoryRow) (int64, err
 			}
 		}
 
-		tag, err := tx.Exec(ctx, `
-			INSERT INTO route_events (event_id, ingest_time, router_id, table_name, afi,
-				prefix, path_id, action, nexthop, as_path, origin, localpref, med,
-				communities_std, communities_ext, communities_large, attrs, bmp_raw)
-			VALUES ($1, date_trunc('day', now()), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
-			ON CONFLICT (event_id, ingest_time) DO NOTHING`,
+		batch.Queue(insertSQL,
 			row.EventID, row.RouterID, row.TableName, row.Event.AFI,
 			row.Event.Prefix, nilIfZero(row.Event.PathID), row.Event.Action,
 			nilIfEmpty(row.Event.Nexthop), nilIfEmpty(row.Event.ASPath),
@@ -86,15 +96,24 @@ func (w *Writer) FlushBatch(ctx context.Context, rows []*HistoryRow) (int64, err
 			row.Event.CommStd, row.Event.CommExt, row.Event.CommLarge,
 			attrsJSON, rawBytes,
 		)
-		if err != nil {
-			return 0, fmt.Errorf("insert route_event: %w", err)
-		}
+	}
 
+	results := tx.SendBatch(ctx, batch)
+	var totalInserted int64
+	for i, row := range rows {
+		tag, err := results.Exec()
+		if err != nil {
+			results.Close()
+			return 0, fmt.Errorf("insert route_event[%d]: %w", i, err)
+		}
 		affected := tag.RowsAffected()
 		totalInserted += affected
 		if affected == 0 {
 			metrics.HistoryDedupConflictsTotal.WithLabelValues(row.Topic).Inc()
 		}
+	}
+	if err := results.Close(); err != nil {
+		return 0, fmt.Errorf("closing batch results: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
