@@ -20,15 +20,22 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 );`
 
 func RunMigrations(ctx context.Context, pool *pgxpool.Pool, migrationsDir string, logger *zap.Logger) error {
+	// Acquire a dedicated connection for advisory lock affinity.
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("acquiring connection for migration: %w", err)
+	}
+	defer conn.Release()
+
 	// Acquire advisory lock to prevent concurrent migrations.
 	const migrationLockID int64 = 0x726962696E676573 // "ribinges" as int64
-	if _, err := pool.Exec(ctx, "SELECT pg_advisory_lock($1)", migrationLockID); err != nil {
+	if _, err := conn.Exec(ctx, "SELECT pg_advisory_lock($1)", migrationLockID); err != nil {
 		return fmt.Errorf("acquiring migration lock: %w", err)
 	}
-	defer pool.Exec(ctx, "SELECT pg_advisory_unlock($1)", migrationLockID)
+	defer conn.Exec(ctx, "SELECT pg_advisory_unlock($1)", migrationLockID)
 
 	// Ensure the schema_migrations table exists.
-	if _, err := pool.Exec(ctx, createMigrationsTable); err != nil {
+	if _, err := conn.Exec(ctx, createMigrationsTable); err != nil {
 		return fmt.Errorf("creating schema_migrations table: %w", err)
 	}
 
@@ -67,7 +74,7 @@ func RunMigrations(ctx context.Context, pool *pgxpool.Pool, migrationsDir string
 
 	// Get applied versions.
 	applied := make(map[int]bool)
-	rows, err := pool.Query(ctx, "SELECT version FROM schema_migrations ORDER BY version")
+	rows, err := conn.Query(ctx, "SELECT version FROM schema_migrations ORDER BY version")
 	if err != nil {
 		return fmt.Errorf("querying applied migrations: %w", err)
 	}
@@ -98,7 +105,7 @@ func RunMigrations(ctx context.Context, pool *pgxpool.Pool, migrationsDir string
 
 		logger.Info("applying migration", zap.Int("version", m.version), zap.String("file", m.filename))
 
-		tx, err := pool.Begin(ctx)
+		tx, err := conn.Begin(ctx)
 		if err != nil {
 			return fmt.Errorf("beginning transaction for migration %d: %w", m.version, err)
 		}

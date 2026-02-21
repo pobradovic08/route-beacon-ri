@@ -34,10 +34,9 @@ const (
 const BMPVersion uint8 = 3
 
 // PeerFlagAddPath is the F-bit in peer_flags (RFC 9069 Section 4.2).
-// Bit 0 (MSB) of the single-octet flags field = 0x80.
-// RFC 9069 Section 4.2 defines the F-bit. The bit position (0x80 vs 0x01)
-// depends on implementation. ParseUpdateAutoDetect provides a safety net
-// regardless of which convention the router uses.
+// Per RFC 9069, this is bit 7 (MSB, 0x80) of the single-octet flags field.
+// ParseUpdateAutoDetect provides a safety net for routers that do not set
+// this bit despite sending Add-Path encoded NLRI.
 const PeerFlagAddPath uint8 = 0x80
 
 // ParsedBMP represents a parsed BMP message.

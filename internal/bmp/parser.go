@@ -18,6 +18,9 @@ func ParseAll(data []byte) ([]*ParsedBMP, error) {
 			break
 		}
 		msgLength := binary.BigEndian.Uint32(remaining[1:5])
+		if msgLength > uint32(len(remaining)) {
+			break
+		}
 		if msgLength < uint32(CommonHeaderSize) || int(msgLength) > len(remaining) {
 			break
 		}
@@ -70,11 +73,13 @@ func Parse(data []byte) (*ParsedBMP, error) {
 		return parseRouteMonitoring(data[CommonHeaderSize:msgLength], result)
 	case MsgTypePeerDown:
 		return parsePeerDown(data[CommonHeaderSize:msgLength], result)
+	case MsgTypePeerUp:
+		return parsePeerUp(data[CommonHeaderSize:msgLength], result)
 	case MsgTypeTermination:
 		result.MsgType = MsgTypeTermination
 		return result, nil
 	default:
-		// Initiation (4), Statistics Report (1), Peer Up (3), Route Mirroring (6) — not needed for Loc-RIB ingestion.
+		// Initiation (4), Statistics Report (1), Route Mirroring (6) — not needed for Loc-RIB ingestion.
 		return result, nil
 	}
 }
@@ -153,16 +158,41 @@ func parsePeerDown(data []byte, result *ParsedBMP) (*ParsedBMP, error) {
 	return result, nil
 }
 
+func parsePeerUp(data []byte, result *ParsedBMP) (*ParsedBMP, error) {
+	if len(data) < PerPeerHeaderSize {
+		return nil, fmt.Errorf("bmp: peer up too short for per-peer header (%d bytes)", len(data))
+	}
+	result.PeerType = data[0]
+	result.PeerFlags = data[1]
+	result.IsLocRIB = result.PeerType == PeerTypeLocRIB
+	result.HasAddPath = (result.PeerFlags & PeerFlagAddPath) != 0
+	if result.IsLocRIB {
+		// RFC 9069 Section 4.4: For Loc-RIB Peer Up, the Sent Open and
+		// Received Open fields are empty (zero-length), so TLVs start
+		// right after the per-peer header.
+		parseTLVs(data[PerPeerHeaderSize:], result)
+	}
+	return result, nil
+}
+
 // bgpMessageLength reads the length field from a BGP message header.
 // BGP header: marker(16) + length(2) + type(1) = 19 bytes minimum.
 func bgpMessageLength(data []byte) (int, error) {
 	if len(data) < 19 {
 		return 0, fmt.Errorf("bmp: bgp message too short (%d bytes)", len(data))
 	}
+	for i := 0; i < 16; i++ {
+		if data[i] != 0xFF {
+			return 0, fmt.Errorf("bmp: invalid bgp marker at byte %d", i)
+		}
+	}
 	// Length is at offset 16-17 (after the 16-byte marker).
 	length := int(binary.BigEndian.Uint16(data[16:18]))
 	if length < 19 {
 		return 0, fmt.Errorf("bmp: invalid bgp message length %d", length)
+	}
+	if length > 4096 {
+		return 0, fmt.Errorf("bmp: bgp message length %d exceeds maximum 4096", length)
 	}
 	return length, nil
 }

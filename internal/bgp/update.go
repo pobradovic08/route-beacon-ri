@@ -39,7 +39,7 @@ func parseUpdatePayload(data []byte, hasAddPath bool) ([]*RouteEvent, error) {
 	}
 
 	// Parse IPv4 withdrawn routes → action 'D'.
-	withdrawnPrefixes := parsePrefixes(data[offset:offset+withdrawnLen], 4, hasAddPath)
+	withdrawnPrefixes, _ := parsePrefixes(data[offset:offset+withdrawnLen], 4, hasAddPath)
 	offset += withdrawnLen
 
 	// Total path attribute length.
@@ -61,7 +61,7 @@ func parseUpdatePayload(data []byte, hasAddPath bool) ([]*RouteEvent, error) {
 	offset += totalPathAttrLen
 
 	// Parse IPv4 NLRI → action 'A'.
-	nlriPrefixes := parsePrefixes(data[offset:], 4, hasAddPath)
+	nlriPrefixes, _ := parsePrefixes(data[offset:], 4, hasAddPath)
 
 	var events []*RouteEvent
 

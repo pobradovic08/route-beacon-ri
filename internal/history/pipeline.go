@@ -51,7 +51,9 @@ func (p *Pipeline) Run(ctx context.Context, records <-chan []*kgo.Record, flushe
 		case recs, ok := <-records:
 			if !ok {
 				if len(batchRecords) > 0 {
-					p.flush(ctx, batch, batchRecords, flushed)
+					shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					p.flush(shutdownCtx, batch, batchRecords, flushed)
 				}
 				return
 			}
@@ -231,14 +233,7 @@ func (p *Pipeline) updateSyncStatus(ctx context.Context, batch []*HistoryRow) {
 		}
 		seen[k] = true
 
-		_, err := p.writer.pool.Exec(ctx, `
-			INSERT INTO rib_sync_status (router_id, table_name, afi, last_raw_msg_time, updated_at)
-			VALUES ($1, $2, $3, now(), now())
-			ON CONFLICT (router_id, table_name, afi)
-			DO UPDATE SET last_raw_msg_time = now(), updated_at = now()`,
-			row.RouterID, row.TableName, row.Event.AFI,
-		)
-		if err != nil {
+		if err := p.writer.UpdateSyncStatus(ctx, row.RouterID, row.TableName, row.Event.AFI); err != nil {
 			p.logger.Warn("failed to update sync status for raw msg",
 				zap.String("router_id", row.RouterID),
 				zap.Error(err),

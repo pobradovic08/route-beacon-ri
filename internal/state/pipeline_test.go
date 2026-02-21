@@ -684,3 +684,102 @@ func TestProcessRawRecord_OversizedPayload(t *testing.T) {
 		t.Errorf("expected actionRoute, got %d", action)
 	}
 }
+
+// --- Stream 3: PeerUp tests ---
+
+func buildBMPPeerUp(peerType uint8, peerAddr [4]byte, tableName string) []byte {
+	pph := buildPerPeerHeader(peerType, 0, peerAddr)
+
+	var tlvData []byte
+	if tableName != "" {
+		tlvData = make([]byte, 4+len(tableName))
+		binary.BigEndian.PutUint16(tlvData[0:2], 0) // TLV type = TableName
+		binary.BigEndian.PutUint16(tlvData[2:4], uint16(len(tableName)))
+		copy(tlvData[4:], tableName)
+	}
+
+	// RFC 9069 §4.4: For Loc-RIB Peer Up, Sent Open and Received Open
+	// are empty (zero-length), so TLVs follow immediately after per-peer header.
+	msgLen := bmp.CommonHeaderSize + len(pph) + len(tlvData)
+	msg := make([]byte, msgLen)
+	msg[0] = 3 // BMP version
+	binary.BigEndian.PutUint32(msg[1:5], uint32(msgLen))
+	msg[5] = bmp.MsgTypePeerUp
+
+	offset := bmp.CommonHeaderSize
+	copy(msg[offset:], pph)
+	offset += len(pph)
+	if len(tlvData) > 0 {
+		copy(msg[offset:], tlvData)
+	}
+
+	return msg
+}
+
+func TestProcessRawRecord_PeerUp_NonLocRIB(t *testing.T) {
+	p := newTestPipeline(true)
+
+	bmpMsg := buildBMPPeerUp(bmp.PeerTypeGlobal, [4]byte{10, 0, 0, 1}, "")
+	frame := wrapOpenBMP(bmpMsg)
+
+	rec := &kgo.Record{Value: frame, Topic: "gobmp.raw"}
+	routes, action := p.processRawRecord(context.Background(), rec)
+
+	// Non-Loc-RIB PeerUp should be filtered (IsLocRIB=false).
+	if routes != nil {
+		t.Errorf("expected nil routes for non-Loc-RIB PeerUp, got %d", len(routes))
+	}
+	if action != actionRoute {
+		t.Errorf("expected actionRoute, got %d", action)
+	}
+}
+
+// --- Stream 3: Mixed routes and EOR in same raw record ---
+
+func TestProcessRawRecord_MixedRoutesAndEOR(t *testing.T) {
+	p := newTestPipeline(true)
+
+	// Build first BMP msg: route announcement
+	nlri := []byte{24, 10, 0, 0}
+	originAttr := buildPathAttr(0x40, bgp.AttrTypeOrigin, []byte{0})
+	nexthopAttr := buildPathAttr(0x40, bgp.AttrTypeNextHop, []byte{192, 168, 1, 1})
+	pathAttrs := append(originAttr, nexthopAttr...)
+	bgpUpdate1 := buildBGPUpdate(nil, pathAttrs, nlri)
+	bmpMsg1 := buildBMPRouteMonitoring(bmp.PeerTypeLocRIB, 0, [4]byte{10, 0, 0, 1}, bgpUpdate1, "locrib")
+
+	// Build second BMP msg: empty UPDATE = IPv4 EOR
+	bgpUpdate2 := buildBGPUpdate(nil, nil, nil)
+	bmpMsg2 := buildBMPRouteMonitoring(bmp.PeerTypeLocRIB, 0, [4]byte{10, 0, 0, 1}, bgpUpdate2, "locrib")
+
+	// Concatenate both BMP messages into a single raw payload
+	combined := append(bmpMsg1, bmpMsg2...)
+	frame := wrapOpenBMP(combined)
+
+	rec := &kgo.Record{Value: frame, Topic: "gobmp.raw"}
+	routes, action := p.processRawRecord(context.Background(), rec)
+
+	if action != actionEOR {
+		t.Fatalf("expected actionEOR, got %d", action)
+	}
+	// Should have the announcement route AND the EOR marker
+	if len(routes) < 2 {
+		t.Fatalf("expected at least 2 routes (announcement + EOR), got %d", len(routes))
+	}
+
+	hasEOR := false
+	hasRoute := false
+	for _, r := range routes {
+		if r.IsEOR {
+			hasEOR = true
+		}
+		if r.Prefix == "10.0.0.0/24" {
+			hasRoute = true
+		}
+	}
+	if !hasEOR {
+		t.Error("expected at least one EOR route")
+	}
+	if !hasRoute {
+		t.Error("expected at least one regular route")
+	}
+}

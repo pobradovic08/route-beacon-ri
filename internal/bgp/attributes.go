@@ -192,7 +192,10 @@ func parseMPReachNLRI(data []byte, attrs *PathAttributes, hasAddPath bool) {
 	}
 
 	afi := binary.BigEndian.Uint16(data[0:2])
-	// safi at data[2]
+	safi := data[2]
+	if safi != SAFIUnicast {
+		return // skip non-unicast AFI/SAFI silently
+	}
 	nhLen := int(data[3])
 
 	attrs.MPReachAFI = afi
@@ -213,6 +216,8 @@ func parseMPReachNLRI(data []byte, attrs *PathAttributes, hasAddPath bool) {
 		// Global + link-local; use global.
 		attrs.MPReachNexthop = net.IP(nhData[:16]).String()
 	}
+	// nhLen is validated implicitly by the switch above; unrecognized
+	// lengths are silently skipped (Nexthop left empty).
 	if attrs.Nexthop == "" {
 		attrs.Nexthop = attrs.MPReachNexthop
 	}
@@ -240,7 +245,7 @@ func parseMPReachNLRI(data []byte, attrs *PathAttributes, hasAddPath bool) {
 
 	// Parse NLRI.
 	if v := afiToVersion(afi); v != 0 {
-		attrs.MPReachNLRI = parsePrefixes(data[offset:], v, hasAddPath)
+		attrs.MPReachNLRI, _ = parsePrefixes(data[offset:], v, hasAddPath)
 	}
 }
 
@@ -250,13 +255,16 @@ func parseMPUnreachNLRI(data []byte, attrs *PathAttributes, hasAddPath bool) {
 	}
 
 	afi := binary.BigEndian.Uint16(data[0:2])
-	// safi at data[2]
+	safi := data[2]
+	if safi != SAFIUnicast {
+		return // skip non-unicast AFI/SAFI silently
+	}
 
 	attrs.MPUnreachAFI = afi
-	attrs.MPUnreachNLRI = parsePrefixes(data[3:], afiToVersion(afi), hasAddPath)
+	attrs.MPUnreachNLRI, _ = parsePrefixes(data[3:], afiToVersion(afi), hasAddPath)
 }
 
-func parsePrefixes(data []byte, ipVersion int, hasAddPath bool) []PrefixInfo {
+func parsePrefixes(data []byte, ipVersion int, hasAddPath bool) ([]PrefixInfo, error) {
 	var prefixes []PrefixInfo
 	offset := 0
 
@@ -264,14 +272,14 @@ func parsePrefixes(data []byte, ipVersion int, hasAddPath bool) []PrefixInfo {
 		var pathID int64
 		if hasAddPath {
 			if offset+4 > len(data) {
-				break
+				return prefixes, fmt.Errorf("bgp: prefix data truncated at offset %d", offset)
 			}
 			pathID = int64(binary.BigEndian.Uint32(data[offset : offset+4]))
 			offset += 4
 		}
 
 		if offset >= len(data) {
-			break
+			return prefixes, fmt.Errorf("bgp: prefix data truncated at offset %d", offset)
 		}
 
 		prefixLen := int(data[offset])
@@ -280,13 +288,13 @@ func parsePrefixes(data []byte, ipVersion int, hasAddPath bool) []PrefixInfo {
 		// Reject prefix lengths that exceed the AFI maximum.
 		maxBits := maxIPLen(ipVersion) * 8
 		if prefixLen > maxBits {
-			break
+			return prefixes, fmt.Errorf("bgp: prefix data truncated at offset %d", offset)
 		}
 
 		// Number of bytes needed for the prefix.
 		byteLen := (prefixLen + 7) / 8
 		if offset+byteLen > len(data) {
-			break
+			return prefixes, fmt.Errorf("bgp: prefix data truncated at offset %d", offset)
 		}
 
 		prefixBytes := make([]byte, maxIPLen(ipVersion))
@@ -306,7 +314,7 @@ func parsePrefixes(data []byte, ipVersion int, hasAddPath bool) []PrefixInfo {
 		})
 	}
 
-	return prefixes
+	return prefixes, nil
 }
 
 func afiToVersion(afi uint16) int {

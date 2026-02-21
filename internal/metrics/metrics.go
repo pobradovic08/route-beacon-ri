@@ -1,6 +1,10 @@
 package metrics
 
-import "github.com/prometheus/client_golang/prometheus"
+import (
+	"sync"
+
+	"github.com/prometheus/client_golang/prometheus"
+)
 
 var (
 	KafkaMessagesTotal = prometheus.NewCounterVec(
@@ -44,6 +48,8 @@ var (
 		[]string{"stage", "reason"},
 	)
 
+	// NOTE: router_id label creates per-router cardinality. In large deployments
+	// (>100 routers), consider removing router_id or using a separate tracking mechanism.
 	EORSeen = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "ribingester_eor_seen",
@@ -52,6 +58,8 @@ var (
 		[]string{"router_id", "table_name", "afi"},
 	)
 
+	// NOTE: router_id label creates per-router cardinality. In large deployments
+	// (>100 routers), consider removing router_id or using a separate tracking mechanism.
 	LastMsgTimestamp = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "ribingester_last_msg_timestamp_seconds",
@@ -86,17 +94,21 @@ var (
 	)
 )
 
+var registerOnce sync.Once
+
 func Register() {
-	prometheus.MustRegister(
-		KafkaMessagesTotal,
-		DBWriteDuration,
-		DBRowsAffectedTotal,
-		HistoryDedupConflictsTotal,
-		ParseErrorsTotal,
-		EORSeen,
-		LastMsgTimestamp,
-		BatchSize,
-		BatchDroppedTotal,
-		RoutesPurgedTotal,
-	)
+	registerOnce.Do(func() {
+		prometheus.MustRegister(
+			KafkaMessagesTotal,
+			DBWriteDuration,
+			DBRowsAffectedTotal,
+			HistoryDedupConflictsTotal,
+			ParseErrorsTotal,
+			EORSeen,
+			LastMsgTimestamp,
+			BatchSize,
+			BatchDroppedTotal,
+			RoutesPurgedTotal,
+		)
+	})
 }

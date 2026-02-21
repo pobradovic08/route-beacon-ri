@@ -540,3 +540,51 @@ func TestDecodeUnicastPrefix_LocalPrefAndMED(t *testing.T) {
 		t.Errorf("expected MED=100, got %d", *r.MED)
 	}
 }
+
+// --- Stream 3: Peer message tests ---
+
+func TestDecodePeerMessage_Up(t *testing.T) {
+	msg := map[string]any{
+		"router_hash": "abc123",
+		"action":      "peer_up",
+		"is_loc_rib":  true,
+		"table_name":  "inet.0",
+	}
+	data, _ := json.Marshal(msg)
+
+	pe, err := DecodePeerMessage(data)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if pe.Action != "peer_up" {
+		t.Errorf("expected action 'peer_up', got '%s'", pe.Action)
+	}
+	if !pe.IsLocRIB {
+		t.Error("expected IsLocRIB=true")
+	}
+}
+
+func TestDecodePeerMessage_TableName(t *testing.T) {
+	msg := map[string]any{
+		"router_hash": "abc123",
+		"action":      "peer_down",
+		"is_loc_rib":  true,
+		"table_name":  "VRF-1",
+	}
+	data, _ := json.Marshal(msg)
+
+	pe, err := DecodePeerMessage(data)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if pe.TableName != "VRF-1" {
+		t.Errorf("expected TableName 'VRF-1', got '%s'", pe.TableName)
+	}
+}
+
+func TestDecodeUnicastPrefix_InvalidJSON(t *testing.T) {
+	_, err := DecodeUnicastPrefix([]byte("not json"), 4)
+	if err == nil {
+		t.Fatal("expected error for invalid JSON")
+	}
+}

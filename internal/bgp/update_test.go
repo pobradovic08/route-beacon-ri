@@ -1114,3 +1114,98 @@ func TestParseCommunity_NonMultipleOf4(t *testing.T) {
 		t.Errorf("expected '64496:100', got '%s'", ev.CommStd[0])
 	}
 }
+
+// --- Stream 3: SAFI validation tests ---
+
+func TestParseMPReachNLRI_NonUnicastSAFI(t *testing.T) {
+	// MP_REACH_NLRI with SAFI=2 (multicast) should produce no events.
+	mpReach := make([]byte, 0, 32)
+	mpReach = append(mpReach, 0, 2) // AFI=2 (IPv6)
+	mpReach = append(mpReach, 2)    // SAFI=2 (multicast) — NOT unicast
+	mpReach = append(mpReach, 16)   // NH len
+	mpReach = append(mpReach, make([]byte, 16)...) // NH (zeros)
+	mpReach = append(mpReach, 0)                   // SNPA count
+	mpReach = append(mpReach, 32, 0x20, 0x01, 0x0d, 0xb8) // prefix /32
+
+	mpReachAttr := buildPathAttr(0x80, AttrTypeMPReachNLRI, mpReach)
+	originAttr := buildPathAttr(0x40, AttrTypeOrigin, []byte{0})
+	pathAttrs := append(originAttr, mpReachAttr...)
+
+	msg := buildBGPUpdate(nil, pathAttrs, nil)
+
+	events, err := ParseUpdate(msg, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(events) != 0 {
+		t.Errorf("expected 0 events for non-unicast SAFI in MP_REACH, got %d", len(events))
+	}
+}
+
+func TestParseMPUnreachNLRI_NonUnicastSAFI(t *testing.T) {
+	// MP_UNREACH_NLRI with SAFI=4 (MPLS-labeled) should produce no events.
+	mpUnreach := []byte{
+		0, 2, // AFI=2
+		4,    // SAFI=4 (MPLS-labeled) — NOT unicast
+		48,   // prefix len
+		0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01, // 6 bytes of prefix
+	}
+	mpUnreachAttr := buildPathAttr(0x80, AttrTypeMPUnreachNLRI, mpUnreach)
+
+	msg := buildBGPUpdate(nil, mpUnreachAttr, nil)
+
+	events, err := ParseUpdate(msg, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(events) != 0 {
+		t.Errorf("expected 0 events for non-unicast SAFI in MP_UNREACH, got %d", len(events))
+	}
+}
+
+// --- Stream 3: parsePrefixes partial error ---
+
+func TestParsePrefixes_PartialError(t *testing.T) {
+	// NLRI with 2 prefixes where the second is truncated.
+	nlri := []byte{
+		24, 10, 0, 0, // valid: 10.0.0.0/24
+		24, 10, // truncated: prefix_len=24 needs 3 bytes, only 1 provided
+	}
+
+	originAttr := buildPathAttr(0x40, AttrTypeOrigin, []byte{0})
+	nexthopAttr := buildPathAttr(0x40, AttrTypeNextHop, []byte{192, 168, 1, 1})
+	pathAttrs := append(originAttr, nexthopAttr...)
+
+	msg := buildBGPUpdate(nil, pathAttrs, nlri)
+
+	events, err := ParseUpdate(msg, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Should get at least 1 event for the valid first prefix.
+	if len(events) < 1 {
+		t.Fatalf("expected at least 1 event for partial NLRI, got %d", len(events))
+	}
+	if events[0].Prefix != "10.0.0.0/24" {
+		t.Errorf("expected prefix '10.0.0.0/24', got '%s'", events[0].Prefix)
+	}
+}
+
+// --- Stream 3: ParseUpdateAutoDetect retry also fails ---
+
+func TestParseUpdateAutoDetect_RetryAlsoFails(t *testing.T) {
+	// Build corrupt NLRI with prefix_len > 32 (invalid for IPv4).
+	// Both initial parse and Add-Path retry should handle gracefully.
+	nlri := []byte{33, 10, 0, 0, 0, 1} // prefix_len=33 > max 32 for IPv4
+
+	originAttr := buildPathAttr(0x40, AttrTypeOrigin, []byte{0})
+	nexthopAttr := buildPathAttr(0x40, AttrTypeNextHop, []byte{192, 168, 1, 1})
+	pathAttrs := append(originAttr, nexthopAttr...)
+
+	msg := buildBGPUpdate(nil, pathAttrs, nlri)
+
+	// Key invariant: no panic, regardless of error/event result.
+	events, _, err := ParseUpdateAutoDetect(msg, false)
+	_ = events
+	_ = err
+}
