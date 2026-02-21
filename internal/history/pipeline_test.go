@@ -2,6 +2,7 @@ package history
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"testing"
 
@@ -144,7 +145,7 @@ func TestHistoryProcessRecord_BasicRoute(t *testing.T) {
 	frame := wrapOpenBMP(bmpMsg)
 
 	rec := &kgo.Record{Value: frame, Topic: "gobmp.raw"}
-	rows := p.processRecord(rec)
+	rows := p.processRecord(context.Background(), rec)
 
 	if len(rows) != 1 {
 		t.Fatalf("expected 1 HistoryRow, got %d", len(rows))
@@ -196,7 +197,7 @@ func TestHistoryProcessRecord_SkipNonLocRIB(t *testing.T) {
 	frame := wrapOpenBMP(bmpMsg)
 
 	rec := &kgo.Record{Value: frame, Topic: "gobmp.raw"}
-	rows := p.processRecord(rec)
+	rows := p.processRecord(context.Background(), rec)
 
 	if len(rows) != 0 {
 		t.Errorf("expected 0 rows for non-Loc-RIB peer, got %d", len(rows))
@@ -213,7 +214,7 @@ func TestHistoryProcessRecord_SkipEOR(t *testing.T) {
 	frame := wrapOpenBMP(bmpMsg)
 
 	rec := &kgo.Record{Value: frame, Topic: "gobmp.raw"}
-	rows := p.processRecord(rec)
+	rows := p.processRecord(context.Background(), rec)
 
 	if len(rows) != 0 {
 		t.Errorf("expected 0 rows for EOR marker, got %d", len(rows))
@@ -238,7 +239,7 @@ func TestHistoryProcessRecord_MultiPrefix(t *testing.T) {
 	frame := wrapOpenBMP(bmpMsg)
 
 	rec := &kgo.Record{Value: frame, Topic: "gobmp.raw"}
-	rows := p.processRecord(rec)
+	rows := p.processRecord(context.Background(), rec)
 
 	if len(rows) != 3 {
 		t.Fatalf("expected 3 HistoryRows, got %d", len(rows))
@@ -295,7 +296,7 @@ func TestHistoryProcessRecord_MultiMessage(t *testing.T) {
 	copy(frame[bmp.OpenBMPHeaderSize:], combined)
 
 	rec := &kgo.Record{Value: frame, Topic: "gobmp.raw"}
-	rows := p.processRecord(rec)
+	rows := p.processRecord(context.Background(), rec)
 
 	if len(rows) != 2 {
 		t.Fatalf("expected 2 HistoryRows from 2 BMP messages, got %d", len(rows))

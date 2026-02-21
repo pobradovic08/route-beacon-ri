@@ -59,7 +59,7 @@ func (p *Pipeline) Run(ctx context.Context, records <-chan []*kgo.Record, flushe
 			}
 
 			for _, rec := range recs {
-				rows := p.processRecord(rec)
+				rows := p.processRecord(ctx, rec)
 				if len(rows) > 0 {
 					batch = append(batch, rows...)
 				}
@@ -98,7 +98,7 @@ func (p *Pipeline) Run(ctx context.Context, records <-chan []*kgo.Record, flushe
 	}
 }
 
-func (p *Pipeline) processRecord(rec *kgo.Record) []*HistoryRow {
+func (p *Pipeline) processRecord(ctx context.Context, rec *kgo.Record) []*HistoryRow {
 	// Step 1: Decode OpenBMP frame.
 	bmpBytes, err := bmp.DecodeOpenBMPFrame(rec.Value, p.maxPayloadBytes)
 	if err != nil {
@@ -126,6 +126,10 @@ func (p *Pipeline) processRecord(rec *kgo.Record) []*HistoryRow {
 
 	var rows []*HistoryRow
 	for _, parsed := range msgs {
+		if parsed.MsgType == bmp.MsgTypeInitiation {
+			p.processInitiation(ctx, rec, parsed, obmpRouterIP)
+			continue
+		}
 		if !parsed.IsLocRIB || parsed.MsgType != bmp.MsgTypeRouteMonitoring || parsed.BGPData == nil {
 			continue
 		}
@@ -194,6 +198,34 @@ func (p *Pipeline) processRecord(rec *kgo.Record) []*HistoryRow {
 	}
 
 	return rows
+}
+
+func (p *Pipeline) processInitiation(ctx context.Context, rec *kgo.Record, parsed *bmp.ParsedBMP, obmpRouterIP string) {
+	metrics.KafkaMessagesTotal.WithLabelValues("history", rec.Topic, "", "initiation").Inc()
+
+	routerIP := obmpRouterIP
+	if routerIP == "" {
+		p.logger.Warn("initiation message has no router IP (legacy OBMP format?)",
+			zap.String("topic", rec.Topic),
+		)
+		return
+	}
+
+	routerID := routerIP
+	if err := UpsertRouter(ctx, p.writer.pool, routerID, routerIP, parsed.SysName, parsed.SysDescr); err != nil {
+		p.logger.Warn("failed to upsert router from initiation",
+			zap.String("router_id", routerID),
+			zap.String("sys_name", parsed.SysName),
+			zap.Error(err),
+		)
+		return
+	}
+
+	p.logger.Info("router metadata upserted from BMP initiation",
+		zap.String("router_id", routerID),
+		zap.String("sys_name", parsed.SysName),
+		zap.String("sys_descr", parsed.SysDescr),
+	)
 }
 
 func (p *Pipeline) flush(ctx context.Context, batch []*HistoryRow, records []*kgo.Record, flushed chan<- []*kgo.Record) bool {
