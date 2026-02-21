@@ -119,6 +119,22 @@ Tracks per-router/table/AFI synchronization state including EOR status, session 
 | `/readyz` | Readiness probe (200 if DB + Kafka consumers healthy) |
 | `/metrics` | Prometheus metrics |
 
+## Known Router Non-Compliance
+
+### Arista cEOS: Add-Path F-bit missing in BMP Loc-RIB (RFC 9069 Section 4.2)
+
+Arista cEOS (tested with cEOS-lab) sends Add-Path encoded NLRI in BMP Loc-RIB Route Monitoring messages but does **not** set the F-bit (0x80) in the per-peer header's peer flags field. Per RFC 9069 Section 4.2, the F-bit "indicates that the Loc-RIB is conveying ADD-PATH information" and MUST be set when Add-Path encoding is used.
+
+**Impact**: Without the F-bit, the BGP UPDATE parser does not read 4-byte path IDs from the NLRI, causing byte misalignment and garbled prefix parsing (e.g. `0.0.0.0/0` or invalid CIDRs like `24.10.0.0/13`).
+
+**Workaround**: `ParseUpdateAutoDetect` in `internal/bgp/update.go` detects this condition by retrying with Add-Path enabled when the initial parse yields suspicious results: either all default-route prefixes (`0.0.0.0/0` or `::/0`) or any invalid CIDRs with host bits set beyond the network mask (e.g. `100.2.0.0/10`). The latter case occurs with ECMP Add-Path data where small path IDs produce garbled but non-default-route prefixes when misinterpreted as prefix lengths. A warning is logged when auto-detection overrides the F-bit.
+
+### Arista cEOS: Peer Address zero in Loc-RIB per-peer header (RFC 9069 Section 4.1)
+
+RFC 9069 Section 4.1 specifies that for Loc-RIB (peer type 3), the Peer Address is set to zero, but the Peer BGP ID field (per-peer header offset 30) contains the local router's BGP identifier. FRRouting non-standardly populates the Peer Address with the router's address, masking this distinction.
+
+The ingester handles both cases: `RouterIDFromPeerHeader` checks the Peer Address first; if it is all zeros, it falls back to the Peer BGP ID field.
+
 ## Development
 
 ```bash

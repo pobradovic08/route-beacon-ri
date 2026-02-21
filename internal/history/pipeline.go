@@ -2,6 +2,7 @@ package history
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"time"
 
@@ -105,60 +106,77 @@ func (p *Pipeline) processRecord(rec *kgo.Record) []*HistoryRow {
 		return nil
 	}
 
-	// Step 2: Compute event_id (SHA256 of BMP bytes, NOT OpenBMP wrapper).
-	eventID := ComputeEventID(bmpBytes)
-
-	// Step 3: Parse BMP message.
-	parsed, err := bmp.Parse(bmpBytes)
+	// A single raw Kafka record may contain multiple concatenated BMP
+	// messages (goBMP bundles an entire TCP read into one record).
+	msgs, err := bmp.ParseAll(bmpBytes)
 	if err != nil {
 		metrics.ParseErrorsTotal.WithLabelValues("bmp", "parse").Inc()
-		p.logger.Warn("failed to parse BMP message",
+		p.logger.Warn("failed to parse BMP messages",
 			zap.String("topic", rec.Topic),
 			zap.Error(err),
 		)
 		return nil
 	}
 
-	// Filter: only process Loc-RIB Route Monitoring messages.
-	if !parsed.IsLocRIB {
-		return nil
-	}
-	if parsed.MsgType != bmp.MsgTypeRouteMonitoring {
-		return nil
-	}
-	if parsed.BGPData == nil {
-		return nil
-	}
+	obmpRouterIP := bmp.RouterIPFromOpenBMPV17(rec.Value)
 
-	// Step 4: Parse BGP UPDATE.
-	events, err := bgp.ParseUpdate(parsed.BGPData, parsed.HasAddPath)
-	if err != nil {
-		metrics.ParseErrorsTotal.WithLabelValues("bgp", "parse").Inc()
-		p.logger.Warn("failed to parse BGP UPDATE",
-			zap.String("topic", rec.Topic),
-			zap.Error(err),
-		)
-		return nil
-	}
-
-	if len(events) == 0 {
-		return nil
-	}
-
-	// Build history rows.
 	var rows []*HistoryRow
-	for _, ev := range events {
-		afiStr := fmt.Sprintf("%d", ev.AFI)
-		metrics.KafkaMessagesTotal.WithLabelValues("history", rec.Topic, afiStr, ev.Action).Inc()
+	for _, parsed := range msgs {
+		if !parsed.IsLocRIB || parsed.MsgType != bmp.MsgTypeRouteMonitoring || parsed.BGPData == nil {
+			continue
+		}
 
-		rows = append(rows, &HistoryRow{
-			EventID:   eventID,
-			RouterID:  bmp.RouterIDFromPeerHeader(bmpBytes[bmp.CommonHeaderSize:]),
-			TableName: parsed.TableName,
-			Event:     ev,
-			BMPRaw:    bmpBytes,
-			Topic:     rec.Topic,
-		})
+		// Compute event_id per BMP message (SHA256 of individual BMP bytes).
+		msgEnd := parsed.Offset + bmp.CommonHeaderSize
+		if msgEnd > len(bmpBytes) {
+			continue
+		}
+		msgLen := int(binary.BigEndian.Uint32(bmpBytes[parsed.Offset+1 : parsed.Offset+5]))
+		if parsed.Offset+msgLen > len(bmpBytes) {
+			continue
+		}
+		eventID := ComputeEventID(bmpBytes[parsed.Offset : parsed.Offset+msgLen])
+
+		// ParseUpdateAutoDetect handles routers that send Add-Path
+		// encoded NLRI without setting the F-bit (e.g. Arista cEOS).
+		events, _, err := bgp.ParseUpdateAutoDetect(parsed.BGPData, parsed.HasAddPath)
+		if err != nil {
+			metrics.ParseErrorsTotal.WithLabelValues("bgp", "parse").Inc()
+			p.logger.Warn("failed to parse BGP UPDATE",
+				zap.String("topic", rec.Topic),
+				zap.Error(err),
+			)
+			continue
+		}
+		if len(events) == 0 {
+			continue
+		}
+
+		// Extract router ID from BMP per-peer header. For Loc-RIB
+		// (RFC 9069), RouterIDFromPeerHeader reads the Peer BGP ID
+		// field since the Peer Address is zero. Fall back to the
+		// OpenBMP v1.7 header's router IP if still empty.
+		peerHdrOffset := parsed.Offset + bmp.CommonHeaderSize
+		routerID := bmp.RouterIDFromPeerHeader(bmpBytes[peerHdrOffset:])
+		if routerID == "" || routerID == "::" || routerID == "0.0.0.0" {
+			if obmpRouterIP != "" {
+				routerID = obmpRouterIP
+			}
+		}
+
+		for _, ev := range events {
+			afiStr := fmt.Sprintf("%d", ev.AFI)
+			metrics.KafkaMessagesTotal.WithLabelValues("history", rec.Topic, afiStr, ev.Action).Inc()
+
+			rows = append(rows, &HistoryRow{
+				EventID:   eventID,
+				RouterID:  routerID,
+				TableName: parsed.TableName,
+				Event:     ev,
+				BMPRaw:    bmpBytes[parsed.Offset : parsed.Offset+msgLen],
+				Topic:     rec.Topic,
+			})
+		}
 	}
 
 	return rows

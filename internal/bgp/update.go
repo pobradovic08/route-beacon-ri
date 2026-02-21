@@ -130,6 +130,55 @@ func parseUpdatePayload(data []byte, hasAddPath bool) ([]*RouteEvent, error) {
 	return events, nil
 }
 
+// ParseUpdateAutoDetect parses a BGP UPDATE, retrying with Add-Path
+// encoding if the initial parse yields suspicious results (all default
+// routes or any invalid CIDRs with host bits set). This handles routers
+// that send Add-Path encoded NLRI without setting the F-bit in the BMP
+// per-peer header, which is non-compliant with RFC 9069 Section 4.2.
+//
+// Returns the parsed events, the actual hasAddPath value used, and any error.
+func ParseUpdateAutoDetect(data []byte, hasAddPath bool) ([]*RouteEvent, bool, error) {
+	events, err := ParseUpdate(data, hasAddPath)
+	if err != nil {
+		return events, hasAddPath, err
+	}
+
+	if !hasAddPath && len(events) > 0 && (allDefaultRoutes(events) || hasInvalidPrefixes(events)) {
+		retryEvents, retryErr := ParseUpdate(data, true)
+		if retryErr == nil && len(retryEvents) > 0 && !allDefaultRoutes(retryEvents) && !hasInvalidPrefixes(retryEvents) {
+			return retryEvents, true, nil
+		}
+	}
+
+	return events, hasAddPath, nil
+}
+
+// allDefaultRoutes returns true if every event has a default-route prefix.
+func allDefaultRoutes(events []*RouteEvent) bool {
+	for _, ev := range events {
+		if ev.Prefix != "0.0.0.0/0" && ev.Prefix != "::/0" {
+			return false
+		}
+	}
+	return true
+}
+
+// hasInvalidPrefixes returns true if any event has a prefix with host bits
+// set beyond the network mask (e.g. 100.2.0.0/10). This indicates garbled
+// parsing, typically from Add-Path encoded data parsed without Add-Path.
+func hasInvalidPrefixes(events []*RouteEvent) bool {
+	for _, ev := range events {
+		ip, ipNet, err := net.ParseCIDR(ev.Prefix)
+		if err != nil {
+			return true
+		}
+		if !ip.Equal(ipNet.IP) {
+			return true
+		}
+	}
+	return false
+}
+
 // DetectEORAFI determines the address family for an End-of-RIB marker.
 // It scans the BGP UPDATE's path attributes for MP_UNREACH_NLRI.
 // If found with AFI=2 (IPv6), returns 6. Otherwise returns 4 (IPv4).

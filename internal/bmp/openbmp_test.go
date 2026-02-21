@@ -92,7 +92,12 @@ func TestDecodeOpenBMPFrame_TruncatedPayload(t *testing.T) {
 }
 
 // buildOpenBMPV17Frame builds an OpenBMP v1.7 binary frame ("OBMP" magic).
+// routerIP is optional; if nil, the router IP field is zeroed.
 func buildOpenBMPV17Frame(payload []byte) []byte {
+	return buildOpenBMPV17FrameWithIP(payload, nil)
+}
+
+func buildOpenBMPV17FrameWithIP(payload []byte, routerIP []byte) []byte {
 	hdrLen := uint16(78) // minimum header with no collector admin ID and no router group
 	frame := make([]byte, int(hdrLen)+len(payload))
 	binary.BigEndian.PutUint32(frame[0:4], 0x4F424D50) // "OBMP" magic
@@ -102,7 +107,17 @@ func buildOpenBMPV17Frame(payload []byte) []byte {
 	binary.BigEndian.PutUint32(frame[8:12], uint32(len(payload)))
 	frame[12] = 0x80 // flags: router message
 	frame[13] = 12   // message type: BMP_RAW
-	// timestamps, hashes, router IP, etc. are zeroed (not used by decoder)
+	// Offset 38: collector admin ID len = 0
+	binary.BigEndian.PutUint16(frame[38:40], 0)
+	// Offset 40: router hash (16 bytes, zeroed)
+	// Offset 56: router IP (16 bytes)
+	if routerIP != nil {
+		copy(frame[56:72], routerIP)
+	}
+	// Offset 72: router group len = 0
+	binary.BigEndian.PutUint16(frame[72:74], 0)
+	// Offset 74: row count = 1
+	binary.BigEndian.PutUint32(frame[74:78], 1)
 	copy(frame[hdrLen:], payload)
 	return frame
 }
@@ -157,6 +172,37 @@ func TestDecodeOpenBMPFrame_V17Oversized(t *testing.T) {
 	_, err := DecodeOpenBMPFrame(frame, 2) // max 2 bytes
 	if err == nil {
 		t.Fatal("expected error for oversized v1.7 payload")
+	}
+}
+
+func TestRouterIPFromOpenBMPV17_IPv4(t *testing.T) {
+	// Router IP = 172.30.0.20 → first 4 bytes = [172, 30, 0, 20], rest zero.
+	routerIP := make([]byte, 16)
+	routerIP[0] = 172
+	routerIP[1] = 30
+	routerIP[2] = 0
+	routerIP[3] = 20
+
+	frame := buildOpenBMPV17FrameWithIP([]byte{0x03}, routerIP)
+	got := RouterIPFromOpenBMPV17(frame)
+	if got != "172.30.0.20" {
+		t.Fatalf("expected 172.30.0.20, got %q", got)
+	}
+}
+
+func TestRouterIPFromOpenBMPV17_NoMagic(t *testing.T) {
+	// Not a v1.7 frame — should return empty.
+	frame := buildOpenBMPFrame(2, 0xAABBCCDD, []byte{0x03})
+	got := RouterIPFromOpenBMPV17(frame)
+	if got != "" {
+		t.Fatalf("expected empty, got %q", got)
+	}
+}
+
+func TestRouterIPFromOpenBMPV17_Truncated(t *testing.T) {
+	got := RouterIPFromOpenBMPV17([]byte{0x4F, 0x42, 0x4D, 0x50, 1, 7})
+	if got != "" {
+		t.Fatalf("expected empty for truncated frame, got %q", got)
 	}
 }
 

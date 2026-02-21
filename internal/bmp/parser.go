@@ -6,6 +6,39 @@ import (
 	"net"
 )
 
+// ParseAll parses all concatenated BMP messages from raw bytes.
+// goBMP may bundle multiple BMP messages in a single raw Kafka record
+// (one per TCP read). Returns all successfully parsed messages.
+func ParseAll(data []byte) ([]*ParsedBMP, error) {
+	var results []*ParsedBMP
+	offset := 0
+	for offset < len(data) {
+		remaining := data[offset:]
+		if len(remaining) < CommonHeaderSize {
+			break
+		}
+		msgLength := binary.BigEndian.Uint32(remaining[1:5])
+		if msgLength < uint32(CommonHeaderSize) || int(msgLength) > len(remaining) {
+			break
+		}
+		parsed, err := Parse(remaining[:msgLength])
+		if err != nil {
+			// Skip this message and try the next.
+			offset += int(msgLength)
+			continue
+		}
+		// Store the offset of this BMP message within the raw payload
+		// so callers can extract the per-peer header.
+		parsed.Offset = offset
+		results = append(results, parsed)
+		offset += int(msgLength)
+	}
+	if len(results) == 0 && offset == 0 {
+		return nil, fmt.Errorf("bmp: no valid messages found in %d bytes", len(data))
+	}
+	return results, nil
+}
+
 // Parse parses a complete BMP message from raw bytes.
 func Parse(data []byte) (*ParsedBMP, error) {
 	if len(data) < CommonHeaderSize {
@@ -141,17 +174,67 @@ func parseTLVs(data []byte, result *ParsedBMP) {
 	}
 }
 
-// RouterIDFromPeerHeader extracts the peer address from a per-peer header for logging.
+// RouterIDFromPeerHeader extracts the router identifier from a BMP per-peer header.
+//
+// Per-peer header layout (RFC 7854 Section 4.2):
+//
+//	Offset  0: Peer Type (1 byte)
+//	Offset  1: Peer Flags (1 byte)
+//	Offset  2: Peer Distinguisher (8 bytes)
+//	Offset 10: Peer Address (16 bytes)
+//	Offset 26: Peer AS (4 bytes)
+//	Offset 30: Peer BGP ID (4 bytes)
+//
+// For Loc-RIB (peer type 3, RFC 9069 Section 4.1), Peer Address and Peer AS
+// are set to zero, but Peer BGP ID contains the local router's BGP identifier.
+// This function checks the Peer Address first; if it is all zeros, it falls
+// back to the Peer BGP ID field.
 func RouterIDFromPeerHeader(data []byte) string {
-	if len(data) < 42 {
+	if len(data) < PerPeerHeaderSize {
 		return ""
 	}
-	// Peer address is at offset 1+1+8 = 10, 16 bytes (IPv6-mapped).
+
+	// Peer address at offset 10, 16 bytes (IPv6-mapped).
 	addr := data[10:26]
-	ip := net.IP(addr)
-	// Check if it's an IPv4-mapped IPv6 address.
-	if v4 := ip.To4(); v4 != nil {
-		return v4.String()
+
+	// Check if peer address is all zeros (Loc-RIB per RFC 9069).
+	allZero := true
+	for _, b := range addr {
+		if b != 0 {
+			allZero = false
+			break
+		}
 	}
-	return ip.String()
+
+	if allZero {
+		// For Loc-RIB, Peer BGP ID at offset 30 (4 bytes) holds the
+		// local BGP identifier (RFC 9069 Section 4.1).
+		bgpID := data[30:34]
+		bgpIDZero := true
+		for _, b := range bgpID {
+			if b != 0 {
+				bgpIDZero = false
+				break
+			}
+		}
+		if !bgpIDZero {
+			return net.IP(bgpID).String()
+		}
+		return ""
+	}
+
+	// BMP (RFC 7854 §4.2) encodes IPv4 as 12 zero bytes + 4 IPv4 bytes,
+	// which differs from the ::ffff: IPv4-mapped format that net.IP.To4()
+	// recognizes. Check for the BMP convention explicitly.
+	isV4 := true
+	for _, b := range addr[:12] {
+		if b != 0 {
+			isV4 = false
+			break
+		}
+	}
+	if isV4 {
+		return net.IP(addr[12:16]).String()
+	}
+	return net.IP(addr).String()
 }

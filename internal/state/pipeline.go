@@ -78,10 +78,14 @@ func (p *Pipeline) Run(ctx context.Context, records <-chan []*kgo.Record, flushe
 				case actionRoute:
 					batch = append(batch, routes...)
 				case actionEOR:
-					// Flush pending routes to DB before EOR handling.
-					// If flush fails, keep batch intact for retry and
-					// skip HandleEOR to avoid advancing offsets past
-					// unflushed routes.
+					// A raw record may contain both regular routes and
+					// EOR markers. Separate them, flush routes first,
+					// then handle each EOR.
+					for _, r := range routes {
+						if !r.IsEOR {
+							batch = append(batch, r)
+						}
+					}
 					if len(batch) > 0 {
 						if err := p.writer.FlushBatch(ctx, batch); err != nil {
 							p.logger.Error("pre-eor flush failed", zap.Error(err))
@@ -89,10 +93,15 @@ func (p *Pipeline) Run(ctx context.Context, records <-chan []*kgo.Record, flushe
 						}
 						batch = nil
 					}
-					if err := p.writer.HandleEOR(ctx, routes[0].RouterID, routes[0].TableName, routes[0].AFI); err != nil {
-						p.logger.Error("EOR handling failed", zap.Error(err))
-					} else if len(batchRecords) > 0 {
-						// EOR succeeded — now safe to commit offsets.
+					for _, r := range routes {
+						if !r.IsEOR {
+							continue
+						}
+						if err := p.writer.HandleEOR(ctx, r.RouterID, r.TableName, r.AFI); err != nil {
+							p.logger.Error("EOR handling failed", zap.Error(err))
+						}
+					}
+					if len(batchRecords) > 0 {
 						select {
 						case flushed <- batchRecords:
 						case <-ctx.Done():
@@ -240,98 +249,129 @@ func (p *Pipeline) processRawRecord(ctx context.Context, rec *kgo.Record) ([]*Pa
 		return nil, actionRoute
 	}
 
-	parsed, err := bmp.Parse(bmpBytes)
+	// A single raw Kafka record may contain multiple concatenated BMP
+	// messages (goBMP bundles an entire TCP read into one record).
+	msgs, err := bmp.ParseAll(bmpBytes)
 	if err != nil {
 		metrics.ParseErrorsTotal.WithLabelValues("raw", "bmp_parse").Inc()
-		p.logger.Warn("failed to parse BMP message",
+		p.logger.Warn("failed to parse BMP messages",
 			zap.String("topic", rec.Topic),
 			zap.Error(err),
 		)
 		return nil, actionRoute
 	}
 
-	if !parsed.IsLocRIB {
-		return nil, actionRoute
-	}
+	// Extract router ID from the OpenBMP v1.7 header (fallback for Loc-RIB).
+	obmpRouterIP := bmp.RouterIPFromOpenBMPV17(rec.Value)
 
-	if parsed.MsgType == bmp.MsgTypePeerDown {
-		routerID := bmp.RouterIDFromPeerHeader(bmpBytes[bmp.CommonHeaderSize:])
-		metrics.KafkaMessagesTotal.WithLabelValues("state", rec.Topic, "", "peer_down").Inc()
-		return []*ParsedRoute{{RouterID: routerID}}, actionPeerDown
-	}
+	var routes []*ParsedRoute
+	finalAction := actionRoute
 
-	if parsed.MsgType != bmp.MsgTypeRouteMonitoring || parsed.BGPData == nil {
-		return nil, actionRoute
-	}
-
-	// Verify this is actually a BGP UPDATE before parsing.
-	// ParseUpdate returns (nil, nil) for non-UPDATE types (e.g. KEEPALIVE),
-	// which would be misclassified as EOR if we didn't check here.
-	if len(parsed.BGPData) < bgp.BGPHeaderSize || parsed.BGPData[18] != bgp.BGPMsgTypeUpdate {
-		return nil, actionRoute
-	}
-
-	events, err := bgp.ParseUpdate(parsed.BGPData, parsed.HasAddPath)
-	if err != nil {
-		metrics.ParseErrorsTotal.WithLabelValues("raw", "bgp_parse").Inc()
-		p.logger.Warn("failed to parse BGP UPDATE",
-			zap.String("topic", rec.Topic),
-			zap.Error(err),
-		)
-		return nil, actionRoute
-	}
-
-	routerID := bmp.RouterIDFromPeerHeader(bmpBytes[bmp.CommonHeaderSize:])
-
-	// EOR: empty UPDATE means End-of-RIB.
-	if len(events) == 0 {
-		afi := bgp.DetectEORAFI(parsed.BGPData)
-		afiStr := fmt.Sprintf("%d", afi)
-		metrics.KafkaMessagesTotal.WithLabelValues("state", rec.Topic, afiStr, "eor").Inc()
-		metrics.LastMsgTimestamp.WithLabelValues("state", routerID, parsed.TableName, afiStr).SetToCurrentTime()
-		return []*ParsedRoute{{
-			RouterID:  routerID,
-			TableName: parsed.TableName,
-			AFI:       afi,
-			IsLocRIB:  true,
-			IsEOR:     true,
-		}}, actionEOR
-	}
-
-	routes := make([]*ParsedRoute, 0, len(events))
-	for _, ev := range events {
-		afiStr := fmt.Sprintf("%d", ev.AFI)
-		metrics.KafkaMessagesTotal.WithLabelValues("state", rec.Topic, afiStr, ev.Action).Inc()
-		metrics.LastMsgTimestamp.WithLabelValues("state", routerID, parsed.TableName, afiStr).SetToCurrentTime()
-
-		r := &ParsedRoute{
-			RouterID:  routerID,
-			TableName: parsed.TableName,
-			AFI:       ev.AFI,
-			Prefix:    ev.Prefix,
-			PathID:    ev.PathID,
-			Action:    ev.Action,
-			IsLocRIB:  true,
-			Nexthop:   ev.Nexthop,
-			ASPath:    ev.ASPath,
-			Origin:    ev.Origin,
-			LocalPref: ev.LocalPref,
-			MED:       ev.MED,
-			CommStd:   ev.CommStd,
-			CommExt:   ev.CommExt,
-			CommLarge: ev.CommLarge,
+	for _, parsed := range msgs {
+		if !parsed.IsLocRIB {
+			continue
 		}
-		if len(ev.Attrs) > 0 {
-			attrs := make(map[string]any, len(ev.Attrs))
-			for k, v := range ev.Attrs {
-				attrs[k] = v
+
+		// Extract router ID from BMP per-peer header. For Loc-RIB
+		// (RFC 9069), RouterIDFromPeerHeader reads the Peer BGP ID
+		// field since the Peer Address is zero. Fall back to the
+		// OpenBMP v1.7 header's router IP if still empty.
+		peerHdrOffset := parsed.Offset + bmp.CommonHeaderSize
+		routerID := bmp.RouterIDFromPeerHeader(bmpBytes[peerHdrOffset:])
+		if routerID == "" || routerID == "::" || routerID == "0.0.0.0" {
+			if obmpRouterIP != "" {
+				routerID = obmpRouterIP
 			}
-			r.Attrs = attrs
 		}
-		routes = append(routes, r)
+
+		if parsed.MsgType == bmp.MsgTypePeerDown {
+			metrics.KafkaMessagesTotal.WithLabelValues("state", rec.Topic, "", "peer_down").Inc()
+			return []*ParsedRoute{{RouterID: routerID}}, actionPeerDown
+		}
+
+		if parsed.MsgType != bmp.MsgTypeRouteMonitoring || parsed.BGPData == nil {
+			continue
+		}
+
+		// Verify this is actually a BGP UPDATE before parsing.
+		if len(parsed.BGPData) < bgp.BGPHeaderSize || parsed.BGPData[18] != bgp.BGPMsgTypeUpdate {
+			continue
+		}
+
+		// ParseUpdateAutoDetect handles routers that send Add-Path
+		// encoded NLRI without setting the F-bit (e.g. Arista cEOS).
+		events, actualAddPath, err := bgp.ParseUpdateAutoDetect(parsed.BGPData, parsed.HasAddPath)
+		if err != nil {
+			metrics.ParseErrorsTotal.WithLabelValues("raw", "bgp_parse").Inc()
+			p.logger.Warn("failed to parse BGP UPDATE",
+				zap.String("topic", rec.Topic),
+				zap.Error(err),
+			)
+			continue
+		}
+
+		if actualAddPath != parsed.HasAddPath {
+			p.logger.Warn("Add-Path auto-detected: router sends Add-Path NLRI without F-bit in BMP per-peer header (RFC 9069 non-compliance)",
+				zap.String("router_id", routerID),
+				zap.String("table_name", parsed.TableName),
+			)
+		}
+
+		// EOR: empty UPDATE means End-of-RIB.
+		if len(events) == 0 {
+			afi := bgp.DetectEORAFI(parsed.BGPData)
+			afiStr := fmt.Sprintf("%d", afi)
+			metrics.KafkaMessagesTotal.WithLabelValues("state", rec.Topic, afiStr, "eor").Inc()
+			metrics.LastMsgTimestamp.WithLabelValues("state", routerID, parsed.TableName, afiStr).SetToCurrentTime()
+			routes = append(routes, &ParsedRoute{
+				RouterID:  routerID,
+				TableName: parsed.TableName,
+				AFI:       afi,
+				IsLocRIB:  true,
+				IsEOR:     true,
+			})
+			finalAction = actionEOR
+			continue
+		}
+
+		for _, ev := range events {
+			afiStr := fmt.Sprintf("%d", ev.AFI)
+			metrics.KafkaMessagesTotal.WithLabelValues("state", rec.Topic, afiStr, ev.Action).Inc()
+			metrics.LastMsgTimestamp.WithLabelValues("state", routerID, parsed.TableName, afiStr).SetToCurrentTime()
+
+			r := &ParsedRoute{
+				RouterID:  routerID,
+				TableName: parsed.TableName,
+				AFI:       ev.AFI,
+				Prefix:    ev.Prefix,
+				PathID:    ev.PathID,
+				Action:    ev.Action,
+				IsLocRIB:  true,
+				Nexthop:   ev.Nexthop,
+				ASPath:    ev.ASPath,
+				Origin:    ev.Origin,
+				LocalPref: ev.LocalPref,
+				MED:       ev.MED,
+				CommStd:   ev.CommStd,
+				CommExt:   ev.CommExt,
+				CommLarge: ev.CommLarge,
+			}
+			if len(ev.Attrs) > 0 {
+				attrs := make(map[string]any, len(ev.Attrs))
+				for k, v := range ev.Attrs {
+					attrs[k] = v
+				}
+				r.Attrs = attrs
+			}
+			routes = append(routes, r)
+		}
 	}
 
-	return routes, actionRoute
+	if len(routes) == 0 {
+		return nil, actionRoute
+	}
+
+	return routes, finalAction
 }
 
 func (p *Pipeline) flush(ctx context.Context, batch []*ParsedRoute, records []*kgo.Record, flushed chan<- []*kgo.Record) error {
