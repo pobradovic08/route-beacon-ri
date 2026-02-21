@@ -158,14 +158,14 @@ func runServe() {
 
 	// --- State pipeline ---
 	stateWriter := state.NewWriter(pool, logger.Named("state.writer"))
-	statePipeline := state.NewPipeline(stateWriter, cfg.Ingest.BatchSize, cfg.Ingest.FlushIntervalMs, logger.Named("state.pipeline"))
+	statePipeline := state.NewPipeline(stateWriter, cfg.Ingest.BatchSize, cfg.Ingest.FlushIntervalMs, cfg.Kafka.State.RawMode, cfg.Ingest.MaxPayloadBytes, logger.Named("state.pipeline"))
 
 	stateRecords := make(chan []*kgo.Record, cfg.Ingest.ChannelBufferSize)
 	stateFlushed := make(chan []*kgo.Record, cfg.Ingest.ChannelBufferSize)
 
 	stateConsumer, err := kafka.NewStateConsumer(
 		cfg.Kafka.Brokers, cfg.Kafka.State.GroupID, cfg.Kafka.State.Topics,
-		cfg.Kafka.ClientID, logger.Named("kafka.state"),
+		cfg.Kafka.ClientID, cfg.Kafka.FetchMaxBytes, logger.Named("kafka.state"),
 	)
 	if err != nil {
 		logger.Fatal("failed to create state consumer", zap.Error(err))
@@ -194,7 +194,7 @@ func runServe() {
 
 	historyConsumer, err := kafka.NewHistoryConsumer(
 		cfg.Kafka.Brokers, cfg.Kafka.History.GroupID, cfg.Kafka.History.Topics,
-		cfg.Kafka.ClientID, logger.Named("kafka.history"),
+		cfg.Kafka.ClientID, cfg.Kafka.FetchMaxBytes, logger.Named("kafka.history"),
 	)
 	if err != nil {
 		logger.Fatal("failed to create history consumer", zap.Error(err))

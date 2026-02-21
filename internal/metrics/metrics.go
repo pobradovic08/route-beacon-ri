@@ -69,6 +69,14 @@ var (
 		[]string{"pipeline"},
 	)
 
+	BatchDroppedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "ribingester_batch_dropped_total",
+			Help: "Batches dropped due to oversized buffer (repeated flush failures).",
+		},
+		[]string{"pipeline"},
+	)
+
 	RoutesPurgedTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "ribingester_routes_purged_total",
@@ -88,6 +96,7 @@ func Register() {
 		EORSeen,
 		LastMsgTimestamp,
 		BatchSize,
+		BatchDroppedTotal,
 		RoutesPurgedTotal,
 	)
 }

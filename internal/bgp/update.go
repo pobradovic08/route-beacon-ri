@@ -15,7 +15,7 @@ func ParseUpdate(data []byte, hasAddPath bool) ([]*RouteEvent, error) {
 	}
 
 	msgType := data[18]
-	if msgType != 2 { // UPDATE = 2
+	if msgType != BGPMsgTypeUpdate {
 		return nil, nil // Not an UPDATE message; skip.
 	}
 
@@ -128,6 +128,81 @@ func parseUpdatePayload(data []byte, hasAddPath bool) ([]*RouteEvent, error) {
 	}
 
 	return events, nil
+}
+
+// DetectEORAFI determines the address family for an End-of-RIB marker.
+// It scans the BGP UPDATE's path attributes for MP_UNREACH_NLRI.
+// If found with AFI=2 (IPv6), returns 6. Otherwise returns 4 (IPv4).
+// Only call this when ParseUpdate returned 0 events and no error.
+func DetectEORAFI(data []byte) int {
+	if len(data) < BGPHeaderSize+4 {
+		return 4
+	}
+
+	payload := data[BGPHeaderSize:]
+	offset := 0
+
+	// Skip withdrawn routes.
+	if offset+2 > len(payload) {
+		return 4
+	}
+	withdrawnLen := int(binary.BigEndian.Uint16(payload[offset : offset+2]))
+	offset += 2
+	if offset+withdrawnLen > len(payload) {
+		return 4
+	}
+	offset += withdrawnLen
+
+	// Read path attributes length.
+	if offset+2 > len(payload) {
+		return 4
+	}
+	pathAttrLen := int(binary.BigEndian.Uint16(payload[offset : offset+2]))
+	offset += 2
+	if offset+pathAttrLen > len(payload) {
+		return 4
+	}
+
+	// Scan path attributes for MP_UNREACH_NLRI (type 15).
+	attrEnd := offset + pathAttrLen
+	for offset < attrEnd {
+		if offset+2 > attrEnd {
+			break
+		}
+		flags := payload[offset]
+		typeCode := payload[offset+1]
+		offset += 2
+
+		var attrLen int
+		if flags&0x10 != 0 { // Extended Length
+			if offset+2 > attrEnd {
+				break
+			}
+			attrLen = int(binary.BigEndian.Uint16(payload[offset : offset+2]))
+			offset += 2
+		} else {
+			if offset+1 > attrEnd {
+				break
+			}
+			attrLen = int(payload[offset])
+			offset++
+		}
+
+		if offset+attrLen > attrEnd {
+			break
+		}
+
+		if typeCode == AttrTypeMPUnreachNLRI && attrLen >= 2 {
+			afi := binary.BigEndian.Uint16(payload[offset : offset+2])
+			if afi == AFIIPv6 {
+				return 6
+			}
+		}
+
+		offset += attrLen
+	}
+
+	return 4
 }
 
 func parsePrefixesV4(data []byte, hasAddPath bool) []PrefixInfo {

@@ -25,15 +25,21 @@ kafka:
     password: ""
 
   # State pipeline: parsed JSON topics (4 unicast prefix + 2 peer)
+  # Set raw_mode: true when goBMP runs with -bmp-raw=true (uses raw OpenBMP topics instead)
   state:
     group_id: "rib-ingester-state"
-    topics:
+    raw_mode: false                     # Set to true when goBMP runs with -bmp-raw=true
+    topics:                             # parsed mode topics (raw_mode: false):
       - "cola.gobmp.parsed.unicast_prefix_v4"
       - "cola.gobmp.parsed.unicast_prefix_v6"
       - "colb.gobmp.parsed.unicast_prefix_v4"
       - "colb.gobmp.parsed.unicast_prefix_v6"
       - "cola.gobmp.parsed.peer"
       - "colb.gobmp.parsed.peer"
+    # When raw_mode: true, replace topics above with raw BMP topics:
+    # topics:
+    #   - "cola.gobmp.bmp_raw"
+    #   - "colb.gobmp.bmp_raw"
 
   # History pipeline: raw BMP topics
   history:

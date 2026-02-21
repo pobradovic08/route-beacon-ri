@@ -69,13 +69,15 @@ func (p *Pipeline) Run(ctx context.Context, records <-chan []*kgo.Record, flushe
 			}
 
 			// Cap memory: if repeated flush failures cause the batch to
-			// grow beyond 10x the configured size, drop it to prevent
-			// unbounded memory growth during prolonged DB outages.
+			// grow beyond 10x the configured size, drop the in-memory
+			// batch to prevent unbounded memory growth. Offsets are NOT
+			// committed so records will be re-consumed on restart.
 			if len(batchRecords) >= p.batchSize*10 {
 				p.logger.Error("dropping oversized batch after repeated flush failures",
 					zap.Int("dropped_records", len(batchRecords)),
 					zap.Int("dropped_rows", len(batch)),
 				)
+				metrics.BatchDroppedTotal.WithLabelValues("history").Inc()
 				batch = nil
 				batchRecords = nil
 			}
@@ -93,7 +95,7 @@ func (p *Pipeline) Run(ctx context.Context, records <-chan []*kgo.Record, flushe
 
 func (p *Pipeline) processRecord(rec *kgo.Record) []*HistoryRow {
 	// Step 1: Decode OpenBMP frame.
-	bmpBytes, err := DecodeOpenBMPFrame(rec.Value, p.maxPayloadBytes)
+	bmpBytes, err := bmp.DecodeOpenBMPFrame(rec.Value, p.maxPayloadBytes)
 	if err != nil {
 		metrics.ParseErrorsTotal.WithLabelValues("openbmp", "decode").Inc()
 		p.logger.Warn("failed to decode OpenBMP frame",

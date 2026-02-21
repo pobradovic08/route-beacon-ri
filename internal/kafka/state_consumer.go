@@ -14,7 +14,7 @@ type StateConsumer struct {
 	joined  atomic.Bool
 }
 
-func NewStateConsumer(brokers []string, groupID string, topics []string, clientID string, logger *zap.Logger) (*StateConsumer, error) {
+func NewStateConsumer(brokers []string, groupID string, topics []string, clientID string, fetchMaxBytes int32, logger *zap.Logger) (*StateConsumer, error) {
 	sc := &StateConsumer{logger: logger}
 
 	opts := []kgo.Opt{
@@ -22,6 +22,7 @@ func NewStateConsumer(brokers []string, groupID string, topics []string, clientI
 		kgo.ConsumerGroup(groupID),
 		kgo.ConsumeTopics(topics...),
 		kgo.ClientID(clientID),
+		kgo.FetchMaxBytes(fetchMaxBytes),
 		kgo.DisableAutoCommit(),
 		kgo.OnPartitionsAssigned(func(_ context.Context, _ *kgo.Client, _ map[string][]int32) {
 			sc.joined.Store(true)
