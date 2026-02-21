@@ -623,3 +623,133 @@ func TestDetectEORAFI_TooShort(t *testing.T) {
 		t.Errorf("expected AFI 4 for truncated data, got %d", afi)
 	}
 }
+
+func TestParseUpdateAutoDetect_AddPathWithoutFBit(t *testing.T) {
+	// Simulate cEOS behavior: Add-Path encoded NLRI with hasAddPath=false.
+	// NLRI: path_id=68 (0x00000044), 10.100.3.0/24 + path_id=57 (0x00000039), 10.100.193.0/24
+	nlri := []byte{
+		0, 0, 0, 68, // path_id=68
+		24, 10, 100, 3, // 10.100.3.0/24
+		0, 0, 0, 57, // path_id=57
+		24, 10, 100, 193, // 10.100.193.0/24
+	}
+
+	originAttr := buildPathAttr(0x40, AttrTypeOrigin, []byte{0})
+	nexthopAttr := buildPathAttr(0x40, AttrTypeNextHop, []byte{10, 0, 0, 2})
+	pathAttrs := append(originAttr, nexthopAttr...)
+
+	msg := buildBGPUpdate(nil, pathAttrs, nlri)
+
+	// Parse with hasAddPath=false (simulating missing F-bit).
+	events, detectedAddPath, err := ParseUpdateAutoDetect(msg, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !detectedAddPath {
+		t.Fatal("expected auto-detection to enable Add-Path")
+	}
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events, got %d", len(events))
+	}
+	if events[0].Prefix != "10.100.3.0/24" {
+		t.Errorf("expected prefix '10.100.3.0/24', got '%s'", events[0].Prefix)
+	}
+	if events[0].PathID != 68 {
+		t.Errorf("expected PathID=68, got %d", events[0].PathID)
+	}
+	if events[1].Prefix != "10.100.193.0/24" {
+		t.Errorf("expected prefix '10.100.193.0/24', got '%s'", events[1].Prefix)
+	}
+	if events[1].PathID != 57 {
+		t.Errorf("expected PathID=57, got %d", events[1].PathID)
+	}
+}
+
+func TestParseUpdateAutoDetect_AddPathECMP(t *testing.T) {
+	// Simulate ECMP Add-Path without F-bit: multiple NLRI with small path_ids
+	// that produce invalid CIDRs (host bits set) when parsed without Add-Path.
+	// path_id=1, 10.100.0.0/24 + path_id=2, 10.100.0.0/24
+	nlri := []byte{
+		0, 0, 0, 1, // path_id=1
+		24, 10, 100, 0, // 10.100.0.0/24
+		0, 0, 0, 2, // path_id=2
+		24, 10, 100, 0, // 10.100.0.0/24
+	}
+
+	originAttr := buildPathAttr(0x40, AttrTypeOrigin, []byte{0})
+	nexthopAttr := buildPathAttr(0x40, AttrTypeNextHop, []byte{172, 30, 0, 30})
+	pathAttrs := append(originAttr, nexthopAttr...)
+
+	msg := buildBGPUpdate(nil, pathAttrs, nlri)
+
+	events, detectedAddPath, err := ParseUpdateAutoDetect(msg, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !detectedAddPath {
+		t.Fatal("expected auto-detection to enable Add-Path for ECMP")
+	}
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events, got %d", len(events))
+	}
+	if events[0].Prefix != "10.100.0.0/24" {
+		t.Errorf("expected prefix '10.100.0.0/24', got '%s'", events[0].Prefix)
+	}
+	if events[0].PathID != 1 {
+		t.Errorf("expected PathID=1, got %d", events[0].PathID)
+	}
+	if events[1].PathID != 2 {
+		t.Errorf("expected PathID=2, got %d", events[1].PathID)
+	}
+}
+
+func TestParseUpdateAutoDetect_NoFalsePositive(t *testing.T) {
+	// Normal NLRI without Add-Path should not trigger auto-detection.
+	nlri := []byte{24, 10, 0, 0} // 10.0.0.0/24
+
+	originAttr := buildPathAttr(0x40, AttrTypeOrigin, []byte{0})
+	nexthopAttr := buildPathAttr(0x40, AttrTypeNextHop, []byte{192, 168, 1, 1})
+	pathAttrs := append(originAttr, nexthopAttr...)
+
+	msg := buildBGPUpdate(nil, pathAttrs, nlri)
+
+	events, detectedAddPath, err := ParseUpdateAutoDetect(msg, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if detectedAddPath {
+		t.Error("expected no Add-Path auto-detection for normal NLRI")
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	if events[0].Prefix != "10.0.0.0/24" {
+		t.Errorf("expected prefix '10.0.0.0/24', got '%s'", events[0].Prefix)
+	}
+}
+
+func TestParseUpdateAutoDetect_RealDefaultRoute(t *testing.T) {
+	// A real 0.0.0.0/0 default route without Add-Path should not trigger detection.
+	nlri := []byte{0} // prefix_len=0 → 0.0.0.0/0
+
+	originAttr := buildPathAttr(0x40, AttrTypeOrigin, []byte{0})
+	nexthopAttr := buildPathAttr(0x40, AttrTypeNextHop, []byte{192, 168, 1, 1})
+	pathAttrs := append(originAttr, nexthopAttr...)
+
+	msg := buildBGPUpdate(nil, pathAttrs, nlri)
+
+	events, detectedAddPath, err := ParseUpdateAutoDetect(msg, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	// If auto-detect retries with Add-Path and gets worse results, it should
+	// keep the original. A single 0.0.0.0/0 followed by retry that produces
+	// nothing valid should keep the original.
+	_ = detectedAddPath // either value is acceptable for a genuine default route
+	if events[0].Prefix != "0.0.0.0/0" {
+		t.Errorf("expected prefix '0.0.0.0/0', got '%s'", events[0].Prefix)
+	}
+}

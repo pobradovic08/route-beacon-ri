@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"net"
 )
 
 const (
@@ -94,4 +95,52 @@ func decodeV17(data []byte, maxPayloadBytes int) ([]byte, error) {
 	}
 
 	return data[hdrLen:totalLen], nil
+}
+
+// RouterIPFromOpenBMPV17 extracts the router IP from an OpenBMP v1.7 header.
+// Returns empty string if the data is not v1.7 or is too short.
+//
+// Header layout (variable due to collector admin ID):
+//
+//	Offset 38:   Collector Admin ID Len (2 bytes)
+//	Offset 40:   Collector Admin ID (N bytes)
+//	Offset 40+N: Router Hash (16 bytes)
+//	Offset 56+N: Router IP (16 bytes)
+func RouterIPFromOpenBMPV17(data []byte) string {
+	if len(data) < openBMPV17MinHdrSize {
+		return ""
+	}
+	if binary.BigEndian.Uint32(data[0:4]) != openBMPV17Magic {
+		return ""
+	}
+
+	// Collector Admin ID length at offset 38.
+	if len(data) < 40 {
+		return ""
+	}
+	adminIDLen := int(binary.BigEndian.Uint16(data[38:40]))
+
+	// Router IP starts at offset 56 + adminIDLen.
+	routerIPOffset := 56 + adminIDLen
+	if len(data) < routerIPOffset+16 {
+		return ""
+	}
+
+	ipBytes := data[routerIPOffset : routerIPOffset+16]
+
+	// Check if it's an IPv4 address (first 4 bytes used, rest zero).
+	allZero := true
+	for _, b := range ipBytes[4:] {
+		if b != 0 {
+			allZero = false
+			break
+		}
+	}
+	if allZero {
+		ip := net.IP(ipBytes[:4])
+		return ip.String()
+	}
+
+	ip := net.IP(ipBytes)
+	return ip.String()
 }

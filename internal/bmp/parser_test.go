@@ -266,3 +266,57 @@ func TestParse_AddPathFlag(t *testing.T) {
 		t.Error("expected HasAddPath=true when F flag is set")
 	}
 }
+
+func TestRouterIDFromPeerHeader_LocRIB_BGPIDFallback(t *testing.T) {
+	// Simulate a Loc-RIB per-peer header where Peer Address (offset 10) is
+	// all zeros but Peer BGP ID (offset 30) is set to 10.0.0.2.
+	// Per RFC 9069 Section 4.1, Loc-RIB sets Peer Address and Peer AS to 0
+	// but fills Peer BGP ID with the local BGP identifier.
+	hdr := make([]byte, PerPeerHeaderSize)
+	hdr[0] = PeerTypeLocRIB
+	// Peer BGP ID at offset 30: 10.0.0.2
+	hdr[30] = 10
+	hdr[31] = 0
+	hdr[32] = 0
+	hdr[33] = 2
+
+	routerID := RouterIDFromPeerHeader(hdr)
+	if routerID != "10.0.0.2" {
+		t.Errorf("expected router ID '10.0.0.2', got '%s'", routerID)
+	}
+}
+
+func TestRouterIDFromPeerHeader_NormalPeer(t *testing.T) {
+	// Normal IPv4 peer. BMP (RFC 7854 §4.2) encodes IPv4 as 12 zero bytes
+	// followed by 4 IPv4 bytes in the 16-byte Peer Address field.
+	// Peer Address starts at offset 10, so IPv4 bytes are at 10+12=22.
+	hdr := make([]byte, PerPeerHeaderSize)
+	hdr[0] = PeerTypeGlobal
+	hdr[22] = 192
+	hdr[23] = 168
+	hdr[24] = 1
+	hdr[25] = 1
+
+	routerID := RouterIDFromPeerHeader(hdr)
+	if routerID != "192.168.1.1" {
+		t.Errorf("expected router ID '192.168.1.1', got '%s'", routerID)
+	}
+}
+
+func TestRouterIDFromPeerHeader_AllZeros(t *testing.T) {
+	// Loc-RIB with both Peer Address and BGP ID all zeros → empty string.
+	hdr := make([]byte, PerPeerHeaderSize)
+	hdr[0] = PeerTypeLocRIB
+
+	routerID := RouterIDFromPeerHeader(hdr)
+	if routerID != "" {
+		t.Errorf("expected empty router ID, got '%s'", routerID)
+	}
+}
+
+func TestRouterIDFromPeerHeader_TooShort(t *testing.T) {
+	routerID := RouterIDFromPeerHeader([]byte{0, 0, 0})
+	if routerID != "" {
+		t.Errorf("expected empty router ID for short data, got '%s'", routerID)
+	}
+}

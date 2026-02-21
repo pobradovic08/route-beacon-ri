@@ -1,0 +1,30 @@
+services:
+  bgp-router:
+    image: ceos:4.35.2F
+    cap_add: []
+    privileged: true
+    command:
+      - /sbin/init
+      - systemd.setenv=INTFTYPE=eth
+      - systemd.setenv=ETBA=1
+      - systemd.setenv=SKIP_ZEROTOUCH_BARRIER_IN_SYSDBINIT=1
+      - systemd.setenv=CEOS=1
+      - systemd.setenv=EOS_PLATFORM=ceoslab
+      - systemd.setenv=container=docker
+      - systemd.setenv=MAPETH0=1
+      - systemd.setenv=MGMT_INTF=eth0
+    volumes:
+      - ./ceos/startup-config:/mnt/flash/startup-config:ro
+
+  route-generator2:
+    image: quay.io/frrouting/frr:10.3.1
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+      - SYS_ADMIN
+    volumes:
+      - ./frr/daemons:/etc/frr/daemons:ro
+      - ./frr/frr-generator2.conf:/etc/frr/frr.conf:ro
+    networks:
+      testnet:
+        ipv4_address: 172.30.0.31

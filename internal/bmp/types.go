@@ -39,11 +39,12 @@ const PeerFlagAddPath uint8 = 0x80
 
 // ParsedBMP represents a parsed BMP message.
 type ParsedBMP struct {
-	MsgType   uint8
-	PeerType  uint8
-	PeerFlags uint8
-	IsLocRIB  bool
+	MsgType    uint8
+	PeerType   uint8
+	PeerFlags  uint8
+	IsLocRIB   bool
 	HasAddPath bool
-	TableName string
-	BGPData   []byte // The encapsulated BGP message bytes
+	TableName  string
+	BGPData    []byte // The encapsulated BGP message bytes
+	Offset     int    // Byte offset of this message within the raw payload (set by ParseAll)
 }
