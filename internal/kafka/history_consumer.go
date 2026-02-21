@@ -2,10 +2,13 @@ package kafka
 
 import (
 	"context"
+	"crypto/tls"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
+	"github.com/twmb/franz-go/pkg/sasl"
 	"go.uber.org/zap"
 )
 
@@ -15,7 +18,8 @@ type HistoryConsumer struct {
 	joined atomic.Bool
 }
 
-func NewHistoryConsumer(brokers []string, groupID string, topics []string, clientID string, fetchMaxBytes int32, logger *zap.Logger) (*HistoryConsumer, error) {
+func NewHistoryConsumer(brokers []string, groupID string, topics []string, clientID string,
+	fetchMaxBytes int32, tlsCfg *tls.Config, saslMech sasl.Mechanism, logger *zap.Logger) (*HistoryConsumer, error) {
 	hc := &HistoryConsumer{logger: logger}
 
 	opts := []kgo.Opt{
@@ -42,6 +46,13 @@ func NewHistoryConsumer(brokers []string, groupID string, topics []string, clien
 		}),
 	}
 
+	if tlsCfg != nil {
+		opts = append(opts, kgo.DialTLSConfig(tlsCfg))
+	}
+	if saslMech != nil {
+		opts = append(opts, kgo.SASL(saslMech))
+	}
+
 	client, err := kgo.NewClient(opts...)
 	if err != nil {
 		return nil, err
@@ -52,10 +63,13 @@ func NewHistoryConsumer(brokers []string, groupID string, topics []string, clien
 }
 
 // Run fetches records and sends them to the records channel.
-func (hc *HistoryConsumer) Run(ctx context.Context, records chan<- []*kgo.Record, flushed <-chan []*kgo.Record) {
+// commitWg is incremented for the commit goroutine so callers can wait for it to drain.
+func (hc *HistoryConsumer) Run(ctx context.Context, records chan<- []*kgo.Record, flushed <-chan []*kgo.Record, commitWg *sync.WaitGroup) {
 	// Start a goroutine to handle offset commits.
 	// Drains the flushed channel completely before exiting.
+	commitWg.Add(1)
 	go func() {
+		defer commitWg.Done()
 		for recs := range flushed {
 			for _, r := range recs {
 				hc.client.MarkCommitRecords(r)

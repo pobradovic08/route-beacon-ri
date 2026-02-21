@@ -63,8 +63,8 @@ func (pm *PartitionManager) CreatePartitions(ctx context.Context) error {
 func (pm *PartitionManager) createPartition(ctx context.Context, from, to time.Time) error {
 	name := fmt.Sprintf("route_events_%s", from.Format("20060102"))
 	safeName := pgx.Identifier{name}.Sanitize()
-	fromStr := from.Format("2006-01-02 15:04:05+00")
-	toStr := to.Format("2006-01-02 15:04:05+00")
+	fromStr := from.UTC().Format("2006-01-02 15:04:05+00")
+	toStr := to.UTC().Format("2006-01-02 15:04:05+00")
 
 	createSQL := fmt.Sprintf(
 		`CREATE TABLE IF NOT EXISTS %s PARTITION OF route_events FOR VALUES FROM ('%s') TO ('%s')`,
@@ -76,14 +76,17 @@ func (pm *PartitionManager) createPartition(ctx context.Context, from, to time.T
 	}
 	pm.logger.Info("partition ensured", zap.String("partition", name))
 
-	// Create per-partition indexes using sanitized name.
+	// Create per-partition indexes using sanitized names.
+	safeIdxPrefix := pgx.Identifier{fmt.Sprintf("idx_%s_prefix_history", name)}.Sanitize()
+	safeIdxChurn := pgx.Identifier{fmt.Sprintf("idx_%s_router_churn", name)}.Sanitize()
+
 	prefixIdx := fmt.Sprintf(
-		`CREATE INDEX IF NOT EXISTS idx_%s_prefix_history ON %s (router_id, table_name, afi, prefix, ingest_time DESC)`,
-		name, safeName,
+		`CREATE INDEX IF NOT EXISTS %s ON %s (router_id, table_name, afi, prefix, ingest_time DESC)`,
+		safeIdxPrefix, safeName,
 	)
 	churnIdx := fmt.Sprintf(
-		`CREATE INDEX IF NOT EXISTS idx_%s_router_churn ON %s (router_id, table_name, afi, ingest_time DESC)`,
-		name, safeName,
+		`CREATE INDEX IF NOT EXISTS %s ON %s (router_id, table_name, afi, ingest_time DESC)`,
+		safeIdxChurn, safeName,
 	)
 
 	if _, err := pm.pool.Exec(ctx, prefixIdx); err != nil {
@@ -135,7 +138,7 @@ func (pm *PartitionManager) DropOldPartitions(ctx context.Context) error {
 
 		// Parse date from partition name: route_events_YYYYMMDD
 		dateStr := name[len(name)-8:]
-		partDate, err := time.Parse("20060102", dateStr)
+		partDate, err := time.ParseInLocation("20060102", dateStr, loc)
 		if err != nil {
 			pm.logger.Warn("cannot parse partition date", zap.String("partition", name))
 			continue

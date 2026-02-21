@@ -570,3 +570,167 @@ func TestParsePeerDown_LocRIB_TableNameTLV(t *testing.T) {
 		t.Errorf("expected TableName='default', got '%s'", parsed.TableName)
 	}
 }
+
+// --- Stream 3: PeerUp tests ---
+
+func TestParsePeerUp_LocRIB(t *testing.T) {
+	// Build a Loc-RIB PeerUp message per RFC 9069 §4.4:
+	// - peer_type=3 (Loc-RIB), peer_flags=0
+	// - No Sent Open or Received Open (zero-length for Loc-RIB)
+	// - TLV: type=0 (TableName), value="locrib"
+	tableName := "locrib"
+	tlv := make([]byte, 4+len(tableName))
+	binary.BigEndian.PutUint16(tlv[0:2], uint16(TLVTypeTableName))
+	binary.BigEndian.PutUint16(tlv[2:4], uint16(len(tableName)))
+	copy(tlv[4:], tableName)
+
+	totalLen := 6 + 42 + len(tlv) // common header + per-peer header + TLV
+	msg := make([]byte, totalLen)
+	msg[0] = BMPVersion
+	binary.BigEndian.PutUint32(msg[1:5], uint32(totalLen))
+	msg[5] = MsgTypePeerUp
+	msg[6] = PeerTypeLocRIB // peer_type
+	// rest of per-peer header is zeros
+	copy(msg[48:], tlv)
+
+	parsed, err := Parse(msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !parsed.IsLocRIB {
+		t.Error("expected IsLocRIB=true for Loc-RIB PeerUp")
+	}
+	if parsed.MsgType != MsgTypePeerUp {
+		t.Errorf("expected MsgType=%d, got %d", MsgTypePeerUp, parsed.MsgType)
+	}
+	if parsed.TableName != "locrib" {
+		t.Errorf("expected TableName='locrib', got '%s'", parsed.TableName)
+	}
+}
+
+func TestParsePeerUp_NonLocRIB(t *testing.T) {
+	// PeerUp with peer_type=0 (Global). No TLVs parsed for non-Loc-RIB.
+	totalLen := 6 + 42 // common header + per-peer header (minimum valid PeerUp)
+	msg := make([]byte, totalLen)
+	msg[0] = BMPVersion
+	binary.BigEndian.PutUint32(msg[1:5], uint32(totalLen))
+	msg[5] = MsgTypePeerUp
+	msg[6] = PeerTypeGlobal
+
+	parsed, err := Parse(msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if parsed.IsLocRIB {
+		t.Error("expected IsLocRIB=false for non-Loc-RIB PeerUp")
+	}
+	if parsed.MsgType != MsgTypePeerUp {
+		t.Errorf("expected MsgType=%d, got %d", MsgTypePeerUp, parsed.MsgType)
+	}
+}
+
+func TestParsePeerUp_TooShort(t *testing.T) {
+	// Only 20 bytes of per-peer header (needs 42). Should return error.
+	totalLen := 6 + 20
+	msg := make([]byte, totalLen)
+	msg[0] = BMPVersion
+	binary.BigEndian.PutUint32(msg[1:5], uint32(totalLen))
+	msg[5] = MsgTypePeerUp
+
+	_, err := Parse(msg)
+	if err == nil {
+		t.Fatal("expected error for PeerUp with truncated per-peer header")
+	}
+}
+
+// --- Stream 3: ParseAll with Termination mid-frame ---
+
+func TestParseAll_TerminationMidFrame(t *testing.T) {
+	// Build 3 concatenated BMP messages:
+	// 1. Route Monitoring (Loc-RIB)
+	// 2. Termination
+	// 3. Route Monitoring (Loc-RIB)
+	bgp := buildMinimalBGPUpdate()
+	msg1 := buildBMPRouteMonitoring(PeerTypeLocRIB, bgp)
+
+	// Termination message: just common header, no per-peer header.
+	msg2 := make([]byte, CommonHeaderSize)
+	msg2[0] = BMPVersion
+	binary.BigEndian.PutUint32(msg2[1:5], uint32(CommonHeaderSize))
+	msg2[5] = MsgTypeTermination
+
+	msg3 := buildBMPRouteMonitoring(PeerTypeLocRIB, bgp)
+
+	combined := make([]byte, 0, len(msg1)+len(msg2)+len(msg3))
+	combined = append(combined, msg1...)
+	combined = append(combined, msg2...)
+	combined = append(combined, msg3...)
+
+	results, err := ParseAll(combined)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(results) != 3 {
+		t.Fatalf("expected 3 parsed messages, got %d", len(results))
+	}
+	if results[0].MsgType != MsgTypeRouteMonitoring {
+		t.Errorf("expected first message MsgType=%d, got %d", MsgTypeRouteMonitoring, results[0].MsgType)
+	}
+	if results[1].MsgType != MsgTypeTermination {
+		t.Errorf("expected second message MsgType=%d, got %d", MsgTypeTermination, results[1].MsgType)
+	}
+	if results[2].MsgType != MsgTypeRouteMonitoring {
+		t.Errorf("expected third message MsgType=%d, got %d", MsgTypeRouteMonitoring, results[2].MsgType)
+	}
+}
+
+// --- Stream 3: BGP marker validation (indirect test of bgpMessageLength) ---
+
+func TestBgpMessageLength_MarkerValidation(t *testing.T) {
+	// Build a BMP Route Monitoring (Loc-RIB) message where the BGP payload
+	// has an invalid marker (byte 5 of BGP header is 0x00 instead of 0xFF).
+	// The parser should fall back to treating all remaining data as BGP data.
+	bgp := buildMinimalBGPUpdate()
+	bgp[5] = 0x00 // corrupt marker byte 5
+
+	bmpMsg := buildBMPRouteMonitoring(PeerTypeLocRIB, bgp)
+
+	parsed, err := Parse(bmpMsg)
+	if err != nil {
+		t.Fatalf("unexpected error (should not panic on bad marker): %v", err)
+	}
+	// With invalid marker, bgpMessageLength returns error so parser falls back
+	// to treating all remaining data as BGP data (no TLV parsing).
+	if parsed.BGPData == nil {
+		t.Error("expected BGPData to be set even with invalid BGP marker")
+	}
+	// TableName should remain default since TLV parsing was skipped.
+	if parsed.TableName != "UNKNOWN" {
+		t.Errorf("expected TableName='UNKNOWN' (no TLV parsed), got '%s'", parsed.TableName)
+	}
+}
+
+// --- Stream 3: BGP length upper bound (indirect test of bgpMessageLength) ---
+
+func TestBgpMessageLength_UpperBound(t *testing.T) {
+	// Build a BMP Route Monitoring (Loc-RIB) message where the BGP header
+	// claims length=5000 (exceeds 4096 max). The parser should fall back to
+	// treating all remaining data as BGP data.
+	bgp := buildMinimalBGPUpdate()
+	// Override BGP length field (at offset 16-17) to 5000.
+	binary.BigEndian.PutUint16(bgp[16:18], 5000)
+
+	bmpMsg := buildBMPRouteMonitoring(PeerTypeLocRIB, bgp)
+
+	parsed, err := Parse(bmpMsg)
+	if err != nil {
+		t.Fatalf("unexpected error (should not panic on oversized BGP length): %v", err)
+	}
+	if parsed.BGPData == nil {
+		t.Error("expected BGPData to be set even with oversized BGP length")
+	}
+	// TableName should remain default since TLV parsing was skipped.
+	if parsed.TableName != "UNKNOWN" {
+		t.Errorf("expected TableName='UNKNOWN' (no TLV parsed), got '%s'", parsed.TableName)
+	}
+}

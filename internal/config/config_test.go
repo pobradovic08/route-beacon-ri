@@ -215,3 +215,67 @@ func TestLoad_EnvEmptyGroupIDFailsValidation(t *testing.T) {
 		t.Fatal("expected validation error for empty state group_id via env")
 	}
 }
+
+// --- Stream 3: Load error tests ---
+
+func TestLoad_NonExistentFile(t *testing.T) {
+	_, err := Load("/tmp/nonexistent_config_12345.yaml")
+	if err == nil {
+		t.Fatal("expected error for non-existent config file")
+	}
+}
+
+func TestLoad_MalformedYAML(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "bad.yaml")
+	if err := os.WriteFile(p, []byte("{{{{not yaml"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(p)
+	if err == nil {
+		t.Fatal("expected error for malformed YAML")
+	}
+}
+
+// --- Stream 3: Validation boundary tests ---
+
+func TestValidate_MaxPayloadBytesZero(t *testing.T) {
+	cfg := validConfig()
+	cfg.Ingest.MaxPayloadBytes = 0
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected error for max_payload_bytes = 0")
+	}
+}
+
+func TestValidate_FetchMaxBytesZero(t *testing.T) {
+	cfg := validConfig()
+	cfg.Kafka.FetchMaxBytes = 0
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected error for fetch_max_bytes = 0")
+	}
+}
+
+func TestValidate_MaxConnsZero(t *testing.T) {
+	cfg := validConfig()
+	cfg.Postgres.MaxConns = 0
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected error for max_conns = 0")
+	}
+}
+
+func TestValidate_MinConnsNegative(t *testing.T) {
+	cfg := validConfig()
+	cfg.Postgres.MinConns = -1
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected error for negative min_conns")
+	}
+}
+
+func TestValidate_MaxPayloadExceedsFetchMax(t *testing.T) {
+	cfg := validConfig()
+	cfg.Ingest.MaxPayloadBytes = 100000000 // 100MB
+	cfg.Kafka.FetchMaxBytes = 1000000      // 1MB
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected error when max_payload_bytes exceeds fetch_max_bytes")
+	}
+}

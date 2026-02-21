@@ -58,7 +58,9 @@ func (p *Pipeline) Run(ctx context.Context, records <-chan []*kgo.Record, flushe
 		case recs, ok := <-records:
 			if !ok {
 				if len(batchRecords) > 0 {
-					if err := p.flush(ctx, batch, batchRecords, flushed); err != nil {
+					shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					if err := p.flush(shutdownCtx, batch, batchRecords, flushed); err != nil {
 						p.logger.Error("final flush failed", zap.Error(err))
 					}
 				}
@@ -254,12 +256,16 @@ func (p *Pipeline) processPeerRecord(ctx context.Context, rec *kgo.Record) ([]*P
 
 	if pe.Action == "peer_up" {
 		metrics.KafkaMessagesTotal.WithLabelValues("state", rec.Topic, "", "peer_up").Inc()
-		if err := p.writer.UpdateSessionStart(ctx, pe.RouterID, pe.TableName, 0); err != nil {
-			p.logger.Error("UpdateSessionStart failed",
-				zap.String("router_id", pe.RouterID),
-				zap.String("table_name", pe.TableName),
-				zap.Error(err),
-			)
+		// PeerUp is session-level — reset both AFI 4 and 6.
+		for _, afi := range []int{4, 6} {
+			if err := p.writer.UpdateSessionStart(ctx, pe.RouterID, pe.TableName, afi); err != nil {
+				p.logger.Error("UpdateSessionStart failed",
+					zap.String("router_id", pe.RouterID),
+					zap.String("table_name", pe.TableName),
+					zap.Int("afi", afi),
+					zap.Error(err),
+				)
+			}
 		}
 		return nil, actionRoute
 	}
@@ -320,12 +326,15 @@ func (p *Pipeline) processRawRecord(ctx context.Context, rec *kgo.Record) ([]*Pa
 
 		if parsed.MsgType == bmp.MsgTypePeerUp {
 			metrics.KafkaMessagesTotal.WithLabelValues("state", rec.Topic, "", "peer_up").Inc()
-			if err := p.writer.UpdateSessionStart(ctx, routerID, parsed.TableName, 0); err != nil {
-				p.logger.Error("UpdateSessionStart failed",
-					zap.String("router_id", routerID),
-					zap.String("table_name", parsed.TableName),
-					zap.Error(err),
-				)
+			for _, afi := range []int{4, 6} {
+				if err := p.writer.UpdateSessionStart(ctx, routerID, parsed.TableName, afi); err != nil {
+					p.logger.Error("UpdateSessionStart failed",
+						zap.String("router_id", routerID),
+						zap.String("table_name", parsed.TableName),
+						zap.Int("afi", afi),
+						zap.Error(err),
+					)
+				}
 			}
 			continue
 		}

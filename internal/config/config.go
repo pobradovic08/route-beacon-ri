@@ -1,7 +1,10 @@
 package config
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -9,6 +12,8 @@ import (
 	"github.com/knadh/koanf/providers/env"
 	"github.com/knadh/koanf/providers/file"
 	"github.com/knadh/koanf/v2"
+	"github.com/twmb/franz-go/pkg/sasl"
+	"github.com/twmb/franz-go/pkg/sasl/plain"
 )
 
 type Config struct {
@@ -136,6 +141,17 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("unmarshaling config: %w", err)
 	}
 
+	// Split comma-separated env strings for slice fields.
+	if len(cfg.Kafka.Brokers) == 1 && strings.Contains(cfg.Kafka.Brokers[0], ",") {
+		cfg.Kafka.Brokers = strings.Split(cfg.Kafka.Brokers[0], ",")
+	}
+	if len(cfg.Kafka.State.Topics) == 1 && strings.Contains(cfg.Kafka.State.Topics[0], ",") {
+		cfg.Kafka.State.Topics = strings.Split(cfg.Kafka.State.Topics[0], ",")
+	}
+	if len(cfg.Kafka.History.Topics) == 1 && strings.Contains(cfg.Kafka.History.Topics[0], ",") {
+		cfg.Kafka.History.Topics = strings.Split(cfg.Kafka.History.Topics[0], ",")
+	}
+
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
@@ -192,5 +208,49 @@ func (c *Config) Validate() error {
 	if _, err := time.LoadLocation(c.Retention.Timezone); err != nil {
 		return fmt.Errorf("config: retention.timezone is invalid: %w", err)
 	}
+	if int32(c.Ingest.MaxPayloadBytes) > c.Kafka.FetchMaxBytes {
+		return fmt.Errorf("config: ingest.max_payload_bytes (%d) exceeds kafka.fetch_max_bytes (%d); messages larger than fetch_max_bytes will be dropped by the broker",
+			c.Ingest.MaxPayloadBytes, c.Kafka.FetchMaxBytes)
+	}
 	return nil
+}
+
+// BuildTLSConfig creates a *tls.Config from the Kafka TLS settings. Returns nil if TLS is disabled.
+func (k *KafkaConfig) BuildTLSConfig() (*tls.Config, error) {
+	if !k.TLS.Enabled {
+		return nil, nil
+	}
+	tlsCfg := &tls.Config{}
+	if k.TLS.CAFile != "" {
+		caPEM, err := os.ReadFile(k.TLS.CAFile)
+		if err != nil {
+			return nil, fmt.Errorf("reading CA file: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(caPEM) {
+			return nil, fmt.Errorf("failed to parse CA certificate")
+		}
+		tlsCfg.RootCAs = pool
+	}
+	if k.TLS.CertFile != "" && k.TLS.KeyFile != "" {
+		cert, err := tls.LoadX509KeyPair(k.TLS.CertFile, k.TLS.KeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("loading client certificate: %w", err)
+		}
+		tlsCfg.Certificates = []tls.Certificate{cert}
+	}
+	return tlsCfg, nil
+}
+
+// BuildSASLMechanism creates a SASL mechanism from the Kafka SASL settings. Returns nil if SASL is disabled.
+func (k *KafkaConfig) BuildSASLMechanism() sasl.Mechanism {
+	if !k.SASL.Enabled {
+		return nil
+	}
+	switch strings.ToUpper(k.SASL.Mechanism) {
+	case "PLAIN":
+		return plain.Auth{User: k.SASL.Username, Pass: k.SASL.Password}.AsMechanism()
+	default:
+		return nil
+	}
 }

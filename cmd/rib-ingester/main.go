@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"sync"
 	"syscall"
 
@@ -157,6 +159,13 @@ func runServe() {
 		logger.Fatal("failed to create partitions on startup", zap.Error(err))
 	}
 
+	// Build TLS and SASL from config.
+	tlsCfg, err := cfg.Kafka.BuildTLSConfig()
+	if err != nil {
+		logger.Fatal("failed to build TLS config", zap.Error(err))
+	}
+	saslMech := cfg.Kafka.BuildSASLMechanism()
+
 	// --- State pipeline ---
 	stateWriter := state.NewWriter(pool, logger.Named("state.writer"))
 	statePipeline := state.NewPipeline(stateWriter, cfg.Ingest.BatchSize, cfg.Ingest.FlushIntervalMs, cfg.Kafka.State.RawMode, cfg.Ingest.MaxPayloadBytes, logger.Named("state.pipeline"))
@@ -166,7 +175,7 @@ func runServe() {
 
 	stateConsumer, err := kafka.NewStateConsumer(
 		cfg.Kafka.Brokers, cfg.Kafka.State.GroupID, cfg.Kafka.State.Topics,
-		cfg.Kafka.ClientID+"-state", cfg.Kafka.FetchMaxBytes, logger.Named("kafka.state"),
+		cfg.Kafka.ClientID+"-state", cfg.Kafka.FetchMaxBytes, tlsCfg, saslMech, logger.Named("kafka.state"),
 	)
 	if err != nil {
 		logger.Fatal("failed to create state consumer", zap.Error(err))
@@ -174,9 +183,14 @@ func runServe() {
 	defer stateConsumer.Close()
 
 	var wg sync.WaitGroup
+	var commitWg sync.WaitGroup
 	wg.Add(2)
-	go func() { defer wg.Done(); stateConsumer.Run(ctx, stateRecords, stateFlushed) }()
-	go func() { defer wg.Done(); statePipeline.Run(ctx, stateRecords, stateFlushed) }()
+	go func() { defer wg.Done(); stateConsumer.Run(ctx, stateRecords, stateFlushed, &commitWg) }()
+	go func() {
+		defer wg.Done()
+		statePipeline.Run(ctx, stateRecords, stateFlushed)
+		close(stateFlushed)
+	}()
 
 	logger.Info("state pipeline started",
 		zap.Strings("topics", cfg.Kafka.State.Topics),
@@ -195,7 +209,7 @@ func runServe() {
 
 	historyConsumer, err := kafka.NewHistoryConsumer(
 		cfg.Kafka.Brokers, cfg.Kafka.History.GroupID, cfg.Kafka.History.Topics,
-		cfg.Kafka.ClientID+"-history", cfg.Kafka.FetchMaxBytes, logger.Named("kafka.history"),
+		cfg.Kafka.ClientID+"-history", cfg.Kafka.FetchMaxBytes, tlsCfg, saslMech, logger.Named("kafka.history"),
 	)
 	if err != nil {
 		logger.Fatal("failed to create history consumer", zap.Error(err))
@@ -203,8 +217,12 @@ func runServe() {
 	defer historyConsumer.Close()
 
 	wg.Add(2)
-	go func() { defer wg.Done(); historyConsumer.Run(ctx, historyRecords, historyFlushed) }()
-	go func() { defer wg.Done(); historyPipeline.Run(ctx, historyRecords, historyFlushed) }()
+	go func() { defer wg.Done(); historyConsumer.Run(ctx, historyRecords, historyFlushed, &commitWg) }()
+	go func() {
+		defer wg.Done()
+		historyPipeline.Run(ctx, historyRecords, historyFlushed)
+		close(historyFlushed)
+	}()
 
 	logger.Info("history pipeline started",
 		zap.Strings("topics", cfg.Kafka.History.Topics),
@@ -224,17 +242,25 @@ func runServe() {
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 	sig := <-sigCh
 	logger.Info("received shutdown signal", zap.String("signal", sig.String()))
-	cancel()
 
 	// Graceful shutdown.
 	shutdownTimeout := time.Duration(cfg.Service.ShutdownTimeoutSeconds) * time.Second
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer shutdownCancel()
 
+	// Stop accepting HTTP traffic first.
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		logger.Error("HTTP server shutdown error", zap.Error(err))
+	}
+
+	// Cancel context to stop pipelines.
+	cancel()
+
 	// Wait for consumer and pipeline goroutines to finish their final flush/commit.
 	done := make(chan struct{})
 	go func() {
 		wg.Wait()
+		commitWg.Wait()
 		close(done)
 	}()
 
@@ -243,10 +269,6 @@ func runServe() {
 		logger.Info("all pipelines stopped gracefully")
 	case <-shutdownCtx.Done():
 		logger.Warn("shutdown timeout reached, some goroutines may not have finished")
-	}
-
-	if err := httpServer.Shutdown(shutdownCtx); err != nil {
-		logger.Error("HTTP server shutdown error", zap.Error(err))
 	}
 
 	logger.Info("rib-ingester stopped")
@@ -299,6 +321,11 @@ func runMaintenance() {
 }
 
 func redactDSN(dsn string) string {
+	if !strings.Contains(dsn, "://") {
+		// keyword=value format — redact password=... portion
+		re := regexp.MustCompile(`password\s*=\s*\S+`)
+		return re.ReplaceAllString(dsn, "password=***")
+	}
 	u, err := url.Parse(dsn)
 	if err != nil {
 		return "***"
