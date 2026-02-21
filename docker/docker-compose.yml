@@ -47,6 +47,7 @@ services:
       - -source-port=5000
       - -kafka-server=kafka:9092
       - -split-af=true
+      - -bmp-raw=true
       - -v=5
     depends_on:
       kafka:

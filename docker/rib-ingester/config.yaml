@@ -15,11 +15,10 @@ kafka:
     enabled: false
 
   state:
-    group_id: "rib-ingester-state"
+    group_id: "rib-ingester-state-raw"
+    raw_mode: true
     topics:
-      - "gobmp.parsed.unicast_prefix_v4"
-      - "gobmp.parsed.unicast_prefix_v6"
-      - "gobmp.parsed.peer"
+      - "gobmp.raw"
 
   history:
     group_id: "rib-ingester-history"

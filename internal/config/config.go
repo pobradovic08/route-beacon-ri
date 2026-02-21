@@ -53,6 +53,7 @@ type SASLConfig struct {
 type ConsumerConfig struct {
 	GroupID string   `koanf:"group_id"`
 	Topics  []string `koanf:"topics"`
+	RawMode bool     `koanf:"raw_mode"`
 }
 
 type PostgresConfig struct {

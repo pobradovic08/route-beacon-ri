@@ -1,4 +1,5 @@
 # Go
+/rib-ingester
 bin/
 spike/
 *.exe

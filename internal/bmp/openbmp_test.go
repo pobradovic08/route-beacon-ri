@@ -1,4 +1,4 @@
-package history
+package bmp
 
 import (
 	"encoding/binary"
@@ -76,6 +76,90 @@ func TestDecodeOpenBMPFrame_ZeroLength(t *testing.T) {
 	}
 }
 
+func TestDecodeOpenBMPFrame_TruncatedPayload(t *testing.T) {
+	// Header is valid but payload is shorter than msg_len claims.
+	// msg_len says 100 bytes but only 5 bytes of payload are present.
+	frame := make([]byte, 10+5)
+	binary.BigEndian.PutUint16(frame[0:2], 2)        // version
+	binary.BigEndian.PutUint32(frame[2:6], 0)        // collector_hash
+	binary.BigEndian.PutUint32(frame[6:10], 100)     // msg_len = 100 (but only 5 bytes follow)
+	copy(frame[10:], []byte{0x03, 0x00, 0x00, 0x00, 0x06})
+
+	_, err := DecodeOpenBMPFrame(frame, 16*1024*1024)
+	if err == nil {
+		t.Fatal("expected error for truncated payload (header OK, payload short)")
+	}
+}
+
+// buildOpenBMPV17Frame builds an OpenBMP v1.7 binary frame ("OBMP" magic).
+func buildOpenBMPV17Frame(payload []byte) []byte {
+	hdrLen := uint16(78) // minimum header with no collector admin ID and no router group
+	frame := make([]byte, int(hdrLen)+len(payload))
+	binary.BigEndian.PutUint32(frame[0:4], 0x4F424D50) // "OBMP" magic
+	frame[4] = 1                                        // major version
+	frame[5] = 7                                        // minor version
+	binary.BigEndian.PutUint16(frame[6:8], hdrLen)
+	binary.BigEndian.PutUint32(frame[8:12], uint32(len(payload)))
+	frame[12] = 0x80 // flags: router message
+	frame[13] = 12   // message type: BMP_RAW
+	// timestamps, hashes, router IP, etc. are zeroed (not used by decoder)
+	copy(frame[hdrLen:], payload)
+	return frame
+}
+
+func TestDecodeOpenBMPFrame_V17Valid(t *testing.T) {
+	payload := []byte{0x03, 0x00, 0x00, 0x00, 0x06, 0x04}
+	frame := buildOpenBMPV17Frame(payload)
+
+	bmpBytes, err := DecodeOpenBMPFrame(frame, 16*1024*1024)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(bmpBytes) != len(payload) {
+		t.Fatalf("expected %d bytes, got %d", len(payload), len(bmpBytes))
+	}
+	for i := range payload {
+		if bmpBytes[i] != payload[i] {
+			t.Fatalf("byte %d: expected 0x%02x, got 0x%02x", i, payload[i], bmpBytes[i])
+		}
+	}
+}
+
+func TestDecodeOpenBMPFrame_V17Truncated(t *testing.T) {
+	payload := []byte{0x03, 0x00, 0x00, 0x00, 0x06, 0x04}
+	frame := buildOpenBMPV17Frame(payload)
+	truncated := frame[:20] // cut short
+
+	_, err := DecodeOpenBMPFrame(truncated, 16*1024*1024)
+	if err == nil {
+		t.Fatal("expected error for truncated v1.7 frame")
+	}
+}
+
+func TestDecodeOpenBMPFrame_V17ZeroMsgLen(t *testing.T) {
+	frame := make([]byte, 78)
+	binary.BigEndian.PutUint32(frame[0:4], 0x4F424D50)
+	frame[4] = 1
+	frame[5] = 7
+	binary.BigEndian.PutUint16(frame[6:8], 78)
+	binary.BigEndian.PutUint32(frame[8:12], 0) // msg_len = 0
+
+	_, err := DecodeOpenBMPFrame(frame, 16*1024*1024)
+	if err == nil {
+		t.Fatal("expected error for zero msg_len in v1.7")
+	}
+}
+
+func TestDecodeOpenBMPFrame_V17Oversized(t *testing.T) {
+	payload := []byte{0x03, 0x00, 0x00, 0x00, 0x06, 0x04}
+	frame := buildOpenBMPV17Frame(payload)
+
+	_, err := DecodeOpenBMPFrame(frame, 2) // max 2 bytes
+	if err == nil {
+		t.Fatal("expected error for oversized v1.7 payload")
+	}
+}
+
 func TestDecodeOpenBMPFrame_MultipleFrames(t *testing.T) {
 	payload1 := []byte{0x01, 0x02, 0x03}
 	payload2 := []byte{0x04, 0x05}
@@ -102,90 +186,5 @@ func TestDecodeOpenBMPFrame_MultipleFrames(t *testing.T) {
 	}
 	if len(bmp2) != 2 {
 		t.Fatalf("frame 2: expected 2 bytes, got %d", len(bmp2))
-	}
-}
-
-// --- Dedup Verification Tests (US3 T033) ---
-
-func TestCrossCollectorDedup_SameBMPPayload(t *testing.T) {
-	// Same BMP payload wrapped in two different OpenBMP frames (different collector_hash).
-	bmpPayload := []byte{0x03, 0x00, 0x00, 0x00, 0x06, 0x00, 0xAA, 0xBB, 0xCC, 0xDD}
-
-	frameCola := buildOpenBMPFrame(2, 0xAAAAAAAA, bmpPayload) // Collector A
-	frameColb := buildOpenBMPFrame(2, 0xBBBBBBBB, bmpPayload) // Collector B
-
-	bmpA, err := DecodeOpenBMPFrame(frameCola, 16*1024*1024)
-	if err != nil {
-		t.Fatalf("cola decode: %v", err)
-	}
-	bmpB, err := DecodeOpenBMPFrame(frameColb, 16*1024*1024)
-	if err != nil {
-		t.Fatalf("colb decode: %v", err)
-	}
-
-	hashA := ComputeEventID(bmpA)
-	hashB := ComputeEventID(bmpB)
-
-	// Hashes must be identical (same BMP bytes, different OpenBMP wrapper).
-	for i := range hashA {
-		if hashA[i] != hashB[i] {
-			t.Fatalf("event_id differs at byte %d: cola=%x colb=%x", i, hashA, hashB)
-		}
-	}
-}
-
-func TestCrossCollectorDedup_DifferentBMPPayload(t *testing.T) {
-	bmpA := []byte{0x03, 0x00, 0x00, 0x00, 0x06, 0x00, 0x11, 0x22}
-	bmpB := []byte{0x03, 0x00, 0x00, 0x00, 0x06, 0x00, 0x33, 0x44}
-
-	frameA := buildOpenBMPFrame(2, 0xAAAAAAAA, bmpA)
-	frameB := buildOpenBMPFrame(2, 0xAAAAAAAA, bmpB)
-
-	extractA, _ := DecodeOpenBMPFrame(frameA, 16*1024*1024)
-	extractB, _ := DecodeOpenBMPFrame(frameB, 16*1024*1024)
-
-	hashA := ComputeEventID(extractA)
-	hashB := ComputeEventID(extractB)
-
-	same := true
-	for i := range hashA {
-		if hashA[i] != hashB[i] {
-			same = false
-			break
-		}
-	}
-	if same {
-		t.Fatal("different BMP payloads should produce different event_ids")
-	}
-}
-
-func TestComputeEventID_Deterministic(t *testing.T) {
-	data := []byte("test BMP message payload")
-	h1 := ComputeEventID(data)
-	h2 := ComputeEventID(data)
-
-	if len(h1) != 32 {
-		t.Fatalf("expected 32 bytes, got %d", len(h1))
-	}
-	for i := range h1 {
-		if h1[i] != h2[i] {
-			t.Fatal("hashes differ for same input")
-		}
-	}
-}
-
-func TestComputeEventID_DifferentInputs(t *testing.T) {
-	h1 := ComputeEventID([]byte("message A"))
-	h2 := ComputeEventID([]byte("message B"))
-
-	same := true
-	for i := range h1 {
-		if h1[i] != h2[i] {
-			same = false
-			break
-		}
-	}
-	if same {
-		t.Fatal("hashes should differ for different inputs")
 	}
 }

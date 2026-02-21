@@ -38,6 +38,11 @@ var OriginValues = map[uint8]string{
 	2: "INCOMPLETE",
 }
 
+// BGP message types.
+const (
+	BGPMsgTypeUpdate uint8 = 2
+)
+
 // BGP UPDATE header size: marker(16) + length(2) + type(1) = 19
 const BGPHeaderSize = 19
 

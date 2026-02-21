@@ -14,7 +14,7 @@ type HistoryConsumer struct {
 	joined atomic.Bool
 }
 
-func NewHistoryConsumer(brokers []string, groupID string, topics []string, clientID string, logger *zap.Logger) (*HistoryConsumer, error) {
+func NewHistoryConsumer(brokers []string, groupID string, topics []string, clientID string, fetchMaxBytes int32, logger *zap.Logger) (*HistoryConsumer, error) {
 	hc := &HistoryConsumer{logger: logger}
 
 	opts := []kgo.Opt{
@@ -22,6 +22,7 @@ func NewHistoryConsumer(brokers []string, groupID string, topics []string, clien
 		kgo.ConsumerGroup(groupID),
 		kgo.ConsumeTopics(topics...),
 		kgo.ClientID(clientID),
+		kgo.FetchMaxBytes(fetchMaxBytes),
 		kgo.DisableAutoCommit(),
 		kgo.OnPartitionsAssigned(func(_ context.Context, _ *kgo.Client, _ map[string][]int32) {
 			hc.joined.Store(true)

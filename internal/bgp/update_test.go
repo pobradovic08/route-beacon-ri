@@ -561,3 +561,65 @@ func TestParseUpdate_IPv6MPUnreach_AddPath(t *testing.T) {
 		t.Errorf("expected PathID=99, got %d", ev.PathID)
 	}
 }
+
+func TestDetectEORAFI_IPv4(t *testing.T) {
+	// Empty BGP UPDATE: withdrawn_len=0, path_attr_len=0, no NLRI → IPv4 EOR.
+	msg := buildBGPUpdate(nil, nil, nil)
+	afi := DetectEORAFI(msg)
+	if afi != 4 {
+		t.Errorf("expected AFI 4, got %d", afi)
+	}
+}
+
+func TestDetectEORAFI_IPv6(t *testing.T) {
+	// BGP UPDATE with MP_UNREACH_NLRI: AFI=2, SAFI=1, no prefixes → IPv6 EOR.
+	mpUnreach := []byte{
+		0, 2, // AFI=2 (IPv6)
+		1,    // SAFI=1 (unicast)
+		// No withdrawn prefixes.
+	}
+	mpUnreachAttr := buildPathAttr(0x80, AttrTypeMPUnreachNLRI, mpUnreach)
+	msg := buildBGPUpdate(nil, mpUnreachAttr, nil)
+	afi := DetectEORAFI(msg)
+	if afi != 6 {
+		t.Errorf("expected AFI 6, got %d", afi)
+	}
+}
+
+func TestDetectEORAFI_IPv6WithPrecedingAttrs(t *testing.T) {
+	// BGP UPDATE with ORIGIN + AS_PATH (extended-length) + MP_UNREACH_NLRI(AFI=2, SAFI=1).
+	// Ensures DetectEORAFI correctly scans past preceding attributes,
+	// including one with the extended-length flag set.
+	originAttr := buildPathAttr(0x40, AttrTypeOrigin, []byte{0}) // 3 bytes
+
+	// Build an AS_PATH with extended-length flag (>255 bytes of AS data).
+	// 65 AS numbers * 4 bytes = 260 bytes of segment data + 2 byte segment header = 262 bytes.
+	asPathData := make([]byte, 2+65*4)
+	asPathData[0] = ASPathSegmentSequence
+	asPathData[1] = 65
+	for i := 0; i < 65; i++ {
+		binary.BigEndian.PutUint32(asPathData[2+i*4:], uint32(64496+i))
+	}
+	asPathAttr := buildPathAttr(0x40, AttrTypeASPath, asPathData) // will auto-set extended-length flag
+
+	// MP_UNREACH_NLRI: AFI=2, SAFI=1, no prefixes → IPv6 EOR.
+	mpUnreach := []byte{0, 2, 1}
+	mpUnreachAttr := buildPathAttr(0x80, AttrTypeMPUnreachNLRI, mpUnreach)
+
+	pathAttrs := append(originAttr, asPathAttr...)
+	pathAttrs = append(pathAttrs, mpUnreachAttr...)
+
+	msg := buildBGPUpdate(nil, pathAttrs, nil)
+	afi := DetectEORAFI(msg)
+	if afi != 6 {
+		t.Errorf("expected AFI 6 with preceding extended-length attrs, got %d", afi)
+	}
+}
+
+func TestDetectEORAFI_TooShort(t *testing.T) {
+	// Truncated data → safe default IPv4.
+	afi := DetectEORAFI([]byte{0xFF})
+	if afi != 4 {
+		t.Errorf("expected AFI 4 for truncated data, got %d", afi)
+	}
+}
