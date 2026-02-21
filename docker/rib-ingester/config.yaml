@@ -24,7 +24,7 @@ kafka:
   history:
     group_id: "rib-ingester-history"
     topics:
-      - "gobmp.bmp_raw"
+      - "gobmp.raw"
 
   fetch_max_bytes: 52428800
 
