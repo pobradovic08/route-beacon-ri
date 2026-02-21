@@ -486,3 +486,78 @@ func TestParseUpdate_MPReachWithNonZeroSNPA(t *testing.T) {
 		t.Errorf("expected nexthop '2001:db8::1', got '%s'", ev.Nexthop)
 	}
 }
+
+func TestParseUpdate_IPv6MPReach_AddPath(t *testing.T) {
+	// MP_REACH_NLRI for IPv6 with Add-Path: path_id=7, 2001:db8::/32
+	nh := []byte{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}
+	mpReach := make([]byte, 0, 64)
+	mpReach = append(mpReach, 0, 2) // AFI=2 (IPv6)
+	mpReach = append(mpReach, 1)    // SAFI=1 (unicast)
+	mpReach = append(mpReach, 16)   // NH len
+	mpReach = append(mpReach, nh...)
+	mpReach = append(mpReach, 0)                     // SNPA count
+	mpReach = append(mpReach, 0, 0, 0, 7)            // path_id=7
+	mpReach = append(mpReach, 32)                     // prefix len = /32
+	mpReach = append(mpReach, 0x20, 0x01, 0x0d, 0xb8) // 4 bytes of prefix
+
+	mpReachAttr := buildPathAttr(0x80, AttrTypeMPReachNLRI, mpReach)
+	originAttr := buildPathAttr(0x40, AttrTypeOrigin, []byte{0})
+	pathAttrs := append(originAttr, mpReachAttr...)
+
+	msg := buildBGPUpdate(nil, pathAttrs, nil)
+
+	events, err := ParseUpdate(msg, true) // hasAddPath=true
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+
+	ev := events[0]
+	if ev.AFI != 6 {
+		t.Errorf("expected AFI 6, got %d", ev.AFI)
+	}
+	if ev.Prefix != "2001:db8::/32" {
+		t.Errorf("expected prefix '2001:db8::/32', got '%s'", ev.Prefix)
+	}
+	if ev.PathID != 7 {
+		t.Errorf("expected PathID=7, got %d", ev.PathID)
+	}
+}
+
+func TestParseUpdate_IPv6MPUnreach_AddPath(t *testing.T) {
+	// MP_UNREACH_NLRI for IPv6 with Add-Path: path_id=99, 2001:db8:1::/48
+	mpUnreach := []byte{
+		0, 2, // AFI=2
+		1,    // SAFI=1
+		0, 0, 0, 99, // path_id=99
+		48,                                    // prefix len
+		0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01,   // 6 bytes of prefix
+	}
+	mpUnreachAttr := buildPathAttr(0x80, AttrTypeMPUnreachNLRI, mpUnreach)
+
+	msg := buildBGPUpdate(nil, mpUnreachAttr, nil)
+
+	events, err := ParseUpdate(msg, true) // hasAddPath=true
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+
+	ev := events[0]
+	if ev.Action != "D" {
+		t.Errorf("expected action 'D', got '%s'", ev.Action)
+	}
+	if ev.AFI != 6 {
+		t.Errorf("expected AFI 6, got %d", ev.AFI)
+	}
+	if ev.Prefix != "2001:db8:1::/48" {
+		t.Errorf("expected prefix '2001:db8:1::/48', got '%s'", ev.Prefix)
+	}
+	if ev.PathID != 99 {
+		t.Errorf("expected PathID=99, got %d", ev.PathID)
+	}
+}

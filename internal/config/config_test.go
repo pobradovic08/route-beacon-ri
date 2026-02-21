@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -55,6 +57,22 @@ func TestValidate_NoDSN(t *testing.T) {
 	cfg.Postgres.DSN = ""
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected error for empty DSN")
+	}
+}
+
+func TestValidate_NoStateGroupID(t *testing.T) {
+	cfg := validConfig()
+	cfg.Kafka.State.GroupID = ""
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected error for empty state group_id")
+	}
+}
+
+func TestValidate_NoHistoryGroupID(t *testing.T) {
+	cfg := validConfig()
+	cfg.Kafka.History.GroupID = ""
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected error for empty history group_id")
 	}
 }
 
@@ -135,5 +153,64 @@ func TestValidate_ValidTimezone(t *testing.T) {
 	cfg.Retention.Timezone = "America/New_York"
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("expected valid config, got error: %v", err)
+	}
+}
+
+func writeMinimalYAML(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	p := filepath.Join(dir, "config.yaml")
+	data := `
+kafka:
+  brokers:
+    - "localhost:9092"
+  state:
+    topics:
+      - "t1"
+  history:
+    topics:
+      - "t2"
+postgres:
+  dsn: "postgres://localhost/test"
+`
+	if err := os.WriteFile(p, []byte(data), 0644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestLoad_EnvOverrideDSN(t *testing.T) {
+	p := writeMinimalYAML(t)
+	t.Setenv("RIB_INGESTER_POSTGRES__DSN", "postgres://envhost/envdb")
+
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Postgres.DSN != "postgres://envhost/envdb" {
+		t.Errorf("expected DSN from env, got %q", cfg.Postgres.DSN)
+	}
+}
+
+func TestLoad_EnvOverrideLogLevel(t *testing.T) {
+	p := writeMinimalYAML(t)
+	t.Setenv("RIB_INGESTER_SERVICE__LOG_LEVEL", "debug")
+
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Service.LogLevel != "debug" {
+		t.Errorf("expected log_level 'debug' from env, got %q", cfg.Service.LogLevel)
+	}
+}
+
+func TestLoad_EnvEmptyGroupIDFailsValidation(t *testing.T) {
+	p := writeMinimalYAML(t)
+	t.Setenv("RIB_INGESTER_KAFKA__STATE__GROUP_ID", "")
+
+	_, err := Load(p)
+	if err == nil {
+		t.Fatal("expected validation error for empty state group_id via env")
 	}
 }

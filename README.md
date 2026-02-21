@@ -35,6 +35,29 @@ export RIB_INGESTER_POSTGRES__DSN="postgres://user:pass@db01:5432/rib?sslmode=di
 export RIB_INGESTER_KAFKA__BROKERS="kafka01:9092,kafka02:9092"
 ```
 
+### Systemd Deployment
+
+The provided systemd unit expects a dedicated user and a binary at `/opt/rib-ingester/`:
+
+```bash
+# Create system user
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin rib-ingester
+
+# Install binary
+sudo mkdir -p /opt/rib-ingester
+sudo cp rib-ingester /opt/rib-ingester/rib-ingester
+
+# Install config
+sudo mkdir -p /etc/rib-ingester
+sudo cp config.example.yaml /etc/rib-ingester/config.yaml
+# Edit /etc/rib-ingester/config.yaml with your settings
+
+# Enable and start
+sudo cp deploy/systemd/rib-ingester.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now rib-ingester
+```
+
 ## Database Setup
 
 ```bash

@@ -68,6 +68,18 @@ func (p *Pipeline) Run(ctx context.Context, records <-chan []*kgo.Record, flushe
 				}
 			}
 
+			// Cap memory: if repeated flush failures cause the batch to
+			// grow beyond 10x the configured size, drop it to prevent
+			// unbounded memory growth during prolonged DB outages.
+			if len(batchRecords) >= p.batchSize*10 {
+				p.logger.Error("dropping oversized batch after repeated flush failures",
+					zap.Int("dropped_records", len(batchRecords)),
+					zap.Int("dropped_rows", len(batch)),
+				)
+				batch = nil
+				batchRecords = nil
+			}
+
 		case <-ticker.C:
 			if len(batchRecords) > 0 {
 				if p.flush(ctx, batch, batchRecords, flushed) {

@@ -22,7 +22,7 @@ const (
 // BMP header sizes.
 const (
 	CommonHeaderSize  = 6  // version(1) + msg_length(4) + msg_type(1)
-	PerPeerHeaderSize = 42 // peer_type(1) + flags(2) + distinguisher(8) + addr(16) + AS(4) + BGPID(4) + ts_sec(4) + ts_usec(4) - 1 byte already included
+	PerPeerHeaderSize = 42 // peer_type(1) + flags(1) + distinguisher(8) + addr(16) + AS(4) + BGPID(4) + ts_sec(4) + ts_usec(4)
 )
 
 // TLV type codes for Loc-RIB Route Monitoring (RFC 9069).
@@ -33,15 +33,15 @@ const (
 // BMPVersion is the expected BMP protocol version.
 const BMPVersion uint8 = 3
 
-// PeerFlagAddPath is the bit position for Add-Path F flag in peer_flags.
-// Bit 7 (counting from 0, MSB first) of the 16-bit flags field = 0x0100.
-const PeerFlagAddPath uint16 = 0x0100
+// PeerFlagAddPath is the F-bit in peer_flags (RFC 9069 Section 4.2).
+// Bit 0 (MSB) of the single-octet flags field = 0x80.
+const PeerFlagAddPath uint8 = 0x80
 
 // ParsedBMP represents a parsed BMP message.
 type ParsedBMP struct {
 	MsgType   uint8
 	PeerType  uint8
-	PeerFlags uint16
+	PeerFlags uint8
 	IsLocRIB  bool
 	HasAddPath bool
 	TableName string

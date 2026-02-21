@@ -255,8 +255,8 @@ func TestParse_NoDataAfterPerPeerHeader(t *testing.T) {
 func TestParse_AddPathFlag(t *testing.T) {
 	bgp := buildMinimalBGPUpdate()
 	bmpMsg := buildBMPRouteMonitoring(PeerTypeLocRIB, bgp)
-	// Set Add-Path F flag: bit 7 of peer_flags at offset 7-8.
-	binary.BigEndian.PutUint16(bmpMsg[7:9], PeerFlagAddPath)
+	// Set Add-Path F flag: bit 0 (MSB) of single-byte peer_flags at offset 7.
+	bmpMsg[7] = PeerFlagAddPath
 
 	parsed, err := Parse(bmpMsg)
 	if err != nil {

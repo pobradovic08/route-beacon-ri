@@ -109,6 +109,18 @@ func (p *Pipeline) Run(ctx context.Context, records <-chan []*kgo.Record, flushe
 				}
 			}
 
+			// Cap memory: if repeated flush failures cause the batch to
+			// grow beyond 10x the configured size, drop it to prevent
+			// unbounded memory growth during prolonged DB outages.
+			if len(batchRecords) >= p.batchSize*10 {
+				p.logger.Error("dropping oversized batch after repeated flush failures",
+					zap.Int("dropped_records", len(batchRecords)),
+					zap.Int("dropped_routes", len(batch)),
+				)
+				batch = nil
+				batchRecords = nil
+			}
+
 		case <-ticker.C:
 			if len(batchRecords) > 0 {
 				if err := p.flush(ctx, batch, batchRecords, flushed); err != nil {
@@ -181,7 +193,7 @@ func (p *Pipeline) processPeerRecord(ctx context.Context, rec *kgo.Record) (*Par
 		return nil, actionRoute
 	}
 
-	if pe.Action == "down" && pe.IsLocRIB {
+	if pe.Action == "peer_down" && pe.IsLocRIB {
 		metrics.KafkaMessagesTotal.WithLabelValues("state", rec.Topic, "", "peer_down").Inc()
 		return &ParsedRoute{RouterID: pe.RouterID}, actionPeerDown
 	}
