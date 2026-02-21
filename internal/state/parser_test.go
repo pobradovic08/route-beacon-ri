@@ -223,6 +223,55 @@ func TestDecodeUnicastPrefix_IPv6FromIsIPv4Flag(t *testing.T) {
 	}
 }
 
+func TestDecodeUnicastPrefix_BaseAttrsfallback(t *testing.T) {
+	// Simulates goBMP v1.1.0 format where as_path, origin, med, communities
+	// are nested inside base_attrs rather than at the top level.
+	msg := map[string]any{
+		"router_hash": "abc123",
+		"action":      "add",
+		"prefix":      "10.0.0.0",
+		"prefix_len":  float64(24),
+		"nexthop":     "172.30.0.30",
+		"is_loc_rib":  true,
+		"is_ipv4":     true,
+		"base_attrs": map[string]any{
+			"as_path":        []any{float64(65002), float64(65001)},
+			"origin":         "igp",
+			"nexthop":        "172.30.0.30",
+			"local_pref":     float64(100),
+			"med":            float64(100),
+			"community_list": "65001:100 65001:200",
+		},
+	}
+	data, _ := json.Marshal(msg)
+
+	r, err := DecodeUnicastPrefix(data, 4)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if r.ASPath != "65002 65001" {
+		t.Errorf("expected as_path '65002 65001', got '%s'", r.ASPath)
+	}
+	if r.Origin != "igp" {
+		t.Errorf("expected origin 'igp', got '%s'", r.Origin)
+	}
+	if r.LocalPref == nil || *r.LocalPref != 100 {
+		t.Errorf("expected localpref 100, got %v", r.LocalPref)
+	}
+	if r.MED == nil || *r.MED != 100 {
+		t.Errorf("expected med 100, got %v", r.MED)
+	}
+	if len(r.CommStd) != 2 || r.CommStd[0] != "65001:100" || r.CommStd[1] != "65001:200" {
+		t.Errorf("expected communities [65001:100 65001:200], got %v", r.CommStd)
+	}
+	// base_attrs should not appear in remaining attrs
+	if r.Attrs != nil {
+		if _, ok := r.Attrs["base_attrs"]; ok {
+			t.Error("base_attrs should not appear in remaining attrs")
+		}
+	}
+}
+
 func TestDecodePeerMessage_Down(t *testing.T) {
 	msg := map[string]any{
 		"router_hash": "abc123",
