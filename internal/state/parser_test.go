@@ -588,3 +588,61 @@ func TestDecodeUnicastPrefix_InvalidJSON(t *testing.T) {
 		t.Fatal("expected error for invalid JSON")
 	}
 }
+
+// --- OriginASN populated during decode ---
+
+func TestDecodeUnicastPrefix_OriginASN(t *testing.T) {
+	msg := map[string]any{
+		"router_hash": "abc123",
+		"action":      "add",
+		"prefix":      "10.0.0.0/24",
+		"as_path":     "64496 64497 64498",
+	}
+	data, _ := json.Marshal(msg)
+
+	r, err := DecodeUnicastPrefix(data, 4)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if r.OriginASN == nil {
+		t.Fatal("expected OriginASN to be non-nil")
+	}
+	if *r.OriginASN != 64498 {
+		t.Errorf("expected OriginASN=64498, got %d", *r.OriginASN)
+	}
+}
+
+func TestDecodeUnicastPrefix_OriginASN_Empty(t *testing.T) {
+	msg := map[string]any{
+		"router_hash": "abc123",
+		"action":      "add",
+		"prefix":      "10.0.0.0/24",
+	}
+	data, _ := json.Marshal(msg)
+
+	r, err := DecodeUnicastPrefix(data, 4)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if r.OriginASN != nil {
+		t.Errorf("expected nil OriginASN for empty as_path, got %d", *r.OriginASN)
+	}
+}
+
+func TestDecodeUnicastPrefix_OriginASN_ASSet(t *testing.T) {
+	msg := map[string]any{
+		"router_hash": "abc123",
+		"action":      "add",
+		"prefix":      "10.0.0.0/24",
+		"as_path":     "64496 {64497,64498}",
+	}
+	data, _ := json.Marshal(msg)
+
+	r, err := DecodeUnicastPrefix(data, 4)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if r.OriginASN != nil {
+		t.Errorf("expected nil OriginASN for AS_SET origin, got %d", *r.OriginASN)
+	}
+}

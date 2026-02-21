@@ -75,13 +75,23 @@ func Parse(data []byte) (*ParsedBMP, error) {
 		return parsePeerDown(data[CommonHeaderSize:msgLength], result)
 	case MsgTypePeerUp:
 		return parsePeerUp(data[CommonHeaderSize:msgLength], result)
+	case MsgTypeInitiation:
+		return parseInitiation(data[CommonHeaderSize:msgLength], result)
 	case MsgTypeTermination:
 		result.MsgType = MsgTypeTermination
 		return result, nil
 	default:
-		// Initiation (4), Statistics Report (1), Route Mirroring (6) — not needed for Loc-RIB ingestion.
+		// Statistics Report (1), Route Mirroring (6) — not needed for Loc-RIB ingestion.
 		return result, nil
 	}
+}
+
+// parseInitiation handles BMP Initiation messages (RFC 7854 §4.3).
+// Initiation messages have no per-peer header — TLVs follow immediately
+// after the common header.
+func parseInitiation(data []byte, result *ParsedBMP) (*ParsedBMP, error) {
+	parseTLVs(data, result)
+	return result, nil
 }
 
 func parseRouteMonitoring(data []byte, result *ParsedBMP) (*ParsedBMP, error) {
@@ -144,12 +154,14 @@ func parsePeerDown(data []byte, result *ParsedBMP) (*ParsedBMP, error) {
 	result.IsLocRIB = result.PeerType == PeerTypeLocRIB
 	result.HasAddPath = (result.PeerFlags & PeerFlagAddPath) != 0
 
+	if len(data) > 42 {
+		result.PeerDownReason = data[42]
+	}
+
 	if result.IsLocRIB {
 		// RFC 9069 Section 5: Peer Down for Loc-RIB includes a reason code
 		// byte after the per-peer header, followed by optional TLVs.
-		if len(data) > 42 {
-			// Reason code at offset 42 (first byte after per-peer header).
-			// Skip reason code, parse TLVs from remaining data.
+		if len(data) > 43 {
 			tlvData := data[43:]
 			parseTLVs(tlvData, result)
 		}
@@ -209,8 +221,16 @@ func parseTLVs(data []byte, result *ParsedBMP) {
 			break
 		}
 
-		if tlvType == TLVTypeTableName && tlvLen > 0 {
-			result.TableName = string(data[offset : offset+tlvLen])
+		value := data[offset : offset+tlvLen]
+		switch tlvType {
+		case TLVTypeTableName:
+			if tlvLen > 0 {
+				result.TableName = string(value)
+			}
+		case TLVTypeSysDescr:
+			result.SysDescr = string(value)
+		case TLVTypeSysName:
+			result.SysName = string(value)
 		}
 
 		offset += tlvLen

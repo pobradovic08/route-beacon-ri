@@ -68,8 +68,8 @@ func (w *Writer) FlushBatch(ctx context.Context, rows []*HistoryRow) (int64, err
 	const insertSQL = `
 		INSERT INTO route_events (event_id, ingest_time, router_id, table_name, afi,
 			prefix, path_id, action, nexthop, as_path, origin, localpref, med,
-			communities_std, communities_ext, communities_large, attrs, bmp_raw)
-		VALUES ($1, date_trunc('day', now() AT TIME ZONE 'UTC')::timestamptz, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+			origin_asn, communities_std, communities_ext, communities_large, attrs, bmp_raw)
+		VALUES ($1, now(), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
 		ON CONFLICT (event_id, ingest_time) DO NOTHING`
 
 	batch := &pgx.Batch{}
@@ -93,6 +93,7 @@ func (w *Writer) FlushBatch(ctx context.Context, rows []*HistoryRow) (int64, err
 			row.Event.Prefix, nilIfZero(row.Event.PathID), row.Event.Action,
 			nilIfEmpty(row.Event.Nexthop), nilIfEmpty(row.Event.ASPath),
 			nilIfEmpty(row.Event.Origin), row.Event.LocalPref, row.Event.MED,
+			bgp.OriginASN(row.Event.ASPath),
 			row.Event.CommStd, row.Event.CommExt, row.Event.CommLarge,
 			attrsJSON, rawBytes,
 		)

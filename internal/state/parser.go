@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	"github.com/route-beacon/rib-ingester/internal/bgp"
 )
 
 // ParsedRoute represents a decoded goBMP unicast prefix JSON message.
@@ -22,6 +24,7 @@ type ParsedRoute struct {
 	Origin     string
 	LocalPref  *uint32
 	MED        *uint32
+	OriginASN  *int
 	CommStd    []string
 	CommExt    []string
 	CommLarge  []string
@@ -134,6 +137,9 @@ func DecodeUnicastPrefix(data []byte, topicAFI int) (*ParsedRoute, error) {
 
 	// Fall back to base_attrs for fields goBMP v1.1.0 nests there
 	mergeBaseAttrs(raw, r)
+
+	// Derive origin ASN from as_path
+	r.OriginASN = bgp.OriginASN(r.ASPath)
 
 	// Remaining attributes → attrs JSONB
 	r.Attrs = extractRemainingAttrs(raw)

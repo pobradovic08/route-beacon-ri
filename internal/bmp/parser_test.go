@@ -734,3 +734,104 @@ func TestBgpMessageLength_UpperBound(t *testing.T) {
 		t.Errorf("expected TableName='UNKNOWN' (no TLV parsed), got '%s'", parsed.TableName)
 	}
 }
+
+// --- BMP Initiation message tests ---
+
+func TestParse_Initiation_SysNameAndSysDescr(t *testing.T) {
+	// Build an Initiation message with SysName and SysDescr TLVs.
+	sysDescr := "FRRouting/10.3.1"
+	sysName := "router1.lab"
+
+	// TLV type=1 (SysDescr)
+	tlv1 := make([]byte, 4+len(sysDescr))
+	binary.BigEndian.PutUint16(tlv1[0:2], TLVTypeSysDescr)
+	binary.BigEndian.PutUint16(tlv1[2:4], uint16(len(sysDescr)))
+	copy(tlv1[4:], sysDescr)
+
+	// TLV type=2 (SysName)
+	tlv2 := make([]byte, 4+len(sysName))
+	binary.BigEndian.PutUint16(tlv2[0:2], TLVTypeSysName)
+	binary.BigEndian.PutUint16(tlv2[2:4], uint16(len(sysName)))
+	copy(tlv2[4:], sysName)
+
+	payload := append(tlv1, tlv2...)
+	totalLen := CommonHeaderSize + len(payload)
+
+	msg := make([]byte, totalLen)
+	msg[0] = BMPVersion
+	binary.BigEndian.PutUint32(msg[1:5], uint32(totalLen))
+	msg[5] = MsgTypeInitiation
+	copy(msg[CommonHeaderSize:], payload)
+
+	parsed, err := Parse(msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if parsed.MsgType != MsgTypeInitiation {
+		t.Errorf("expected MsgType=%d, got %d", MsgTypeInitiation, parsed.MsgType)
+	}
+	if parsed.SysDescr != sysDescr {
+		t.Errorf("expected SysDescr=%q, got %q", sysDescr, parsed.SysDescr)
+	}
+	if parsed.SysName != sysName {
+		t.Errorf("expected SysName=%q, got %q", sysName, parsed.SysName)
+	}
+}
+
+func TestParse_Initiation_NoTLVs(t *testing.T) {
+	// Initiation with no TLVs — should succeed without error.
+	totalLen := CommonHeaderSize
+	msg := make([]byte, totalLen)
+	msg[0] = BMPVersion
+	binary.BigEndian.PutUint32(msg[1:5], uint32(totalLen))
+	msg[5] = MsgTypeInitiation
+
+	parsed, err := Parse(msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if parsed.MsgType != MsgTypeInitiation {
+		t.Errorf("expected MsgType=%d, got %d", MsgTypeInitiation, parsed.MsgType)
+	}
+	if parsed.SysName != "" {
+		t.Errorf("expected empty SysName, got %q", parsed.SysName)
+	}
+}
+
+// --- PeerDown reason code test ---
+
+func TestParsePeerDown_ReasonCode(t *testing.T) {
+	totalLen := 6 + 42 + 1 // common header + per-peer header + reason byte
+	msg := make([]byte, totalLen)
+	msg[0] = BMPVersion
+	binary.BigEndian.PutUint32(msg[1:5], uint32(totalLen))
+	msg[5] = MsgTypePeerDown
+	msg[6] = PeerTypeLocRIB
+	msg[48] = 3 // reason code = 3 (Local system closed, NOTIFICATION)
+
+	parsed, err := Parse(msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if parsed.PeerDownReason != 3 {
+		t.Errorf("expected PeerDownReason=3, got %d", parsed.PeerDownReason)
+	}
+}
+
+func TestParsePeerDown_NoReasonByte(t *testing.T) {
+	// Peer Down with exactly the per-peer header and nothing else.
+	totalLen := 6 + 42
+	msg := make([]byte, totalLen)
+	msg[0] = BMPVersion
+	binary.BigEndian.PutUint32(msg[1:5], uint32(totalLen))
+	msg[5] = MsgTypePeerDown
+	msg[6] = PeerTypeGlobal
+
+	parsed, err := Parse(msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if parsed.PeerDownReason != 0 {
+		t.Errorf("expected PeerDownReason=0 (no reason byte), got %d", parsed.PeerDownReason)
+	}
+}

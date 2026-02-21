@@ -173,8 +173,52 @@ func parseCommunity(data []byte, attrs *PathAttributes) {
 
 func parseExtCommunity(data []byte, attrs *PathAttributes) {
 	for i := 0; i+8 <= len(data); i += 8 {
-		attrs.CommExt = append(attrs.CommExt, hex.EncodeToString(data[i:i+8]))
+		attrs.CommExt = append(attrs.CommExt, decodeExtCommunity(data[i:i+8]))
 	}
+}
+
+// decodeExtCommunity decodes a single 8-byte extended community into a
+// human-readable string. Recognises Route Target (subtype 0x02) and
+// Route Origin / Site-of-Origin (subtype 0x03) for 2-octet AS, IPv4,
+// and 4-octet AS types. Falls back to hex for unknown types.
+func decodeExtCommunity(data []byte) string {
+	typeHigh := data[0]
+	typeLow := data[1]
+
+	// Mask transitive bit for matching.
+	typeHighBase := typeHigh & 0x3F
+
+	switch typeHighBase {
+	case 0x00: // 2-Octet AS Specific
+		asn := binary.BigEndian.Uint16(data[2:4])
+		val := binary.BigEndian.Uint32(data[4:8])
+		switch typeLow {
+		case 0x02:
+			return fmt.Sprintf("RT:%d:%d", asn, val)
+		case 0x03:
+			return fmt.Sprintf("SOO:%d:%d", asn, val)
+		}
+	case 0x01: // IPv4 Address Specific
+		ip := net.IP(data[2:6]).String()
+		val := binary.BigEndian.Uint16(data[6:8])
+		switch typeLow {
+		case 0x02:
+			return fmt.Sprintf("RT:%s:%d", ip, val)
+		case 0x03:
+			return fmt.Sprintf("SOO:%s:%d", ip, val)
+		}
+	case 0x02: // 4-Octet AS Specific
+		asn := binary.BigEndian.Uint32(data[2:6])
+		val := binary.BigEndian.Uint16(data[6:8])
+		switch typeLow {
+		case 0x02:
+			return fmt.Sprintf("RT:%d:%d", asn, val)
+		case 0x03:
+			return fmt.Sprintf("SOO:%d:%d", asn, val)
+		}
+	}
+
+	return hex.EncodeToString(data)
 }
 
 func parseLargeCommunity(data []byte, attrs *PathAttributes) {
@@ -333,4 +377,29 @@ func maxIPLen(version int) int {
 		return 4
 	}
 	return 16
+}
+
+// OriginASN extracts the origin AS number (last ASN) from a space-delimited
+// AS path string. Returns nil if the path is empty or ends with an AS_SET
+// (e.g. "{64497,64498}").
+func OriginASN(asPath string) *int {
+	asPath = strings.TrimSpace(asPath)
+	if asPath == "" {
+		return nil
+	}
+
+	fields := strings.Fields(asPath)
+	last := fields[len(fields)-1]
+
+	// AS_SET at the end → origin is ambiguous.
+	if strings.HasPrefix(last, "{") {
+		return nil
+	}
+
+	var asn int
+	_, err := fmt.Sscanf(last, "%d", &asn)
+	if err != nil {
+		return nil
+	}
+	return &asn
 }

@@ -25,9 +25,11 @@ const (
 	PerPeerHeaderSize = 42 // peer_type(1) + flags(1) + distinguisher(8) + addr(16) + AS(4) + BGPID(4) + ts_sec(4) + ts_usec(4)
 )
 
-// TLV type codes for Loc-RIB Route Monitoring (RFC 9069).
+// TLV type codes (RFC 7854 §4.4, RFC 9069).
 const (
 	TLVTypeTableName uint16 = 0
+	TLVTypeSysDescr  uint16 = 1
+	TLVTypeSysName   uint16 = 2
 )
 
 // BMPVersion is the expected BMP protocol version.
@@ -41,12 +43,15 @@ const PeerFlagAddPath uint8 = 0x80
 
 // ParsedBMP represents a parsed BMP message.
 type ParsedBMP struct {
-	MsgType    uint8
-	PeerType   uint8
-	PeerFlags  uint8
-	IsLocRIB   bool
-	HasAddPath bool
-	TableName  string
-	BGPData    []byte // The encapsulated BGP message bytes
-	Offset     int    // Byte offset of this message within the raw payload (set by ParseAll)
+	MsgType        uint8
+	PeerType       uint8
+	PeerFlags      uint8
+	IsLocRIB       bool
+	HasAddPath     bool
+	TableName      string
+	BGPData        []byte // The encapsulated BGP message bytes
+	Offset         int    // Byte offset of this message within the raw payload (set by ParseAll)
+	SysName        string // From Initiation TLV type 2
+	SysDescr       string // From Initiation TLV type 1
+	PeerDownReason uint8  // Reason code from Peer Down (offset 42)
 }

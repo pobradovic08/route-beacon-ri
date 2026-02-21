@@ -932,12 +932,12 @@ func TestParseExtCommunities(t *testing.T) {
 	if len(ev.CommExt) != 2 {
 		t.Fatalf("expected 2 extended communities, got %d", len(ev.CommExt))
 	}
-	// Each 8-byte community should be hex-encoded.
-	if ev.CommExt[0] != "0002fbf000000064" {
-		t.Errorf("expected CommExt[0]='0002fbf000000064', got '%s'", ev.CommExt[0])
+	// 2-Octet AS Route Target: type 0x00, subtype 0x02 → "RT:ASN:value"
+	if ev.CommExt[0] != "RT:64496:100" {
+		t.Errorf("expected CommExt[0]='RT:64496:100', got '%s'", ev.CommExt[0])
 	}
-	if ev.CommExt[1] != "0002fbf0000000c8" {
-		t.Errorf("expected CommExt[1]='0002fbf0000000c8', got '%s'", ev.CommExt[1])
+	if ev.CommExt[1] != "RT:64496:200" {
+		t.Errorf("expected CommExt[1]='RT:64496:200', got '%s'", ev.CommExt[1])
 	}
 }
 
@@ -1208,4 +1208,170 @@ func TestParseUpdateAutoDetect_RetryAlsoFails(t *testing.T) {
 	events, _, err := ParseUpdateAutoDetect(msg, false)
 	_ = events
 	_ = err
+}
+
+// --- OriginASN tests ---
+
+func TestOriginASN_SimpleSequence(t *testing.T) {
+	asn := OriginASN("64496 64497 64498")
+	if asn == nil {
+		t.Fatal("expected non-nil origin ASN")
+	}
+	if *asn != 64498 {
+		t.Errorf("expected 64498, got %d", *asn)
+	}
+}
+
+func TestOriginASN_SingleASN(t *testing.T) {
+	asn := OriginASN("64496")
+	if asn == nil {
+		t.Fatal("expected non-nil origin ASN")
+	}
+	if *asn != 64496 {
+		t.Errorf("expected 64496, got %d", *asn)
+	}
+}
+
+func TestOriginASN_Empty(t *testing.T) {
+	asn := OriginASN("")
+	if asn != nil {
+		t.Errorf("expected nil for empty as_path, got %d", *asn)
+	}
+}
+
+func TestOriginASN_ASSetAtEnd(t *testing.T) {
+	asn := OriginASN("64496 {64497,64498}")
+	if asn != nil {
+		t.Errorf("expected nil for AS_SET origin, got %d", *asn)
+	}
+}
+
+func TestOriginASN_Whitespace(t *testing.T) {
+	asn := OriginASN("  64496  64497  ")
+	if asn == nil {
+		t.Fatal("expected non-nil origin ASN")
+	}
+	if *asn != 64497 {
+		t.Errorf("expected 64497, got %d", *asn)
+	}
+}
+
+// --- Extended community decoding tests ---
+
+func TestDecodeExtCommunity_IPv4RT(t *testing.T) {
+	// IPv4 Address Specific Route Target: type 0x01, subtype 0x02
+	// IPv4: 10.0.0.1, value: 100
+	data := []byte{0x01, 0x02, 10, 0, 0, 1, 0, 100}
+	extCommAttr := buildPathAttr(0xC0, AttrTypeExtCommunity, data)
+
+	nlri := []byte{24, 10, 0, 0}
+	originAttr := buildPathAttr(0x40, AttrTypeOrigin, []byte{0})
+	nexthopAttr := buildPathAttr(0x40, AttrTypeNextHop, []byte{192, 168, 1, 1})
+	pathAttrs := append(originAttr, append(extCommAttr, nexthopAttr...)...)
+
+	msg := buildBGPUpdate(nil, pathAttrs, nlri)
+
+	events, err := ParseUpdate(msg, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	if len(events[0].CommExt) != 1 {
+		t.Fatalf("expected 1 ext community, got %d", len(events[0].CommExt))
+	}
+	if events[0].CommExt[0] != "RT:10.0.0.1:100" {
+		t.Errorf("expected 'RT:10.0.0.1:100', got '%s'", events[0].CommExt[0])
+	}
+}
+
+func TestDecodeExtCommunity_4OctetASRT(t *testing.T) {
+	// 4-Octet AS Route Target: type 0x02, subtype 0x02
+	// AS: 131072 (0x00020000), value: 500
+	data := []byte{0x02, 0x02, 0x00, 0x02, 0x00, 0x00, 0x01, 0xF4}
+	extCommAttr := buildPathAttr(0xC0, AttrTypeExtCommunity, data)
+
+	nlri := []byte{24, 10, 0, 0}
+	originAttr := buildPathAttr(0x40, AttrTypeOrigin, []byte{0})
+	nexthopAttr := buildPathAttr(0x40, AttrTypeNextHop, []byte{192, 168, 1, 1})
+	pathAttrs := append(originAttr, append(extCommAttr, nexthopAttr...)...)
+
+	msg := buildBGPUpdate(nil, pathAttrs, nlri)
+
+	events, err := ParseUpdate(msg, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(events[0].CommExt) != 1 {
+		t.Fatalf("expected 1 ext community, got %d", len(events[0].CommExt))
+	}
+	if events[0].CommExt[0] != "RT:131072:500" {
+		t.Errorf("expected 'RT:131072:500', got '%s'", events[0].CommExt[0])
+	}
+}
+
+func TestDecodeExtCommunity_SOO(t *testing.T) {
+	// 2-Octet AS Site-of-Origin: type 0x00, subtype 0x03
+	// AS: 64496, value: 1
+	data := []byte{0x00, 0x03, 0xFB, 0xF0, 0x00, 0x00, 0x00, 0x01}
+	extCommAttr := buildPathAttr(0xC0, AttrTypeExtCommunity, data)
+
+	nlri := []byte{24, 10, 0, 0}
+	originAttr := buildPathAttr(0x40, AttrTypeOrigin, []byte{0})
+	nexthopAttr := buildPathAttr(0x40, AttrTypeNextHop, []byte{192, 168, 1, 1})
+	pathAttrs := append(originAttr, append(extCommAttr, nexthopAttr...)...)
+
+	msg := buildBGPUpdate(nil, pathAttrs, nlri)
+
+	events, err := ParseUpdate(msg, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if events[0].CommExt[0] != "SOO:64496:1" {
+		t.Errorf("expected 'SOO:64496:1', got '%s'", events[0].CommExt[0])
+	}
+}
+
+func TestDecodeExtCommunity_TransitiveBit(t *testing.T) {
+	// Transitive 2-Octet AS Route Target: type 0x40, subtype 0x02
+	// (bit 6 set = non-transitive, but we mask with 0x3F)
+	data := []byte{0x40, 0x02, 0xFB, 0xF0, 0x00, 0x00, 0x00, 0x64}
+	extCommAttr := buildPathAttr(0xC0, AttrTypeExtCommunity, data)
+
+	nlri := []byte{24, 10, 0, 0}
+	originAttr := buildPathAttr(0x40, AttrTypeOrigin, []byte{0})
+	nexthopAttr := buildPathAttr(0x40, AttrTypeNextHop, []byte{192, 168, 1, 1})
+	pathAttrs := append(originAttr, append(extCommAttr, nexthopAttr...)...)
+
+	msg := buildBGPUpdate(nil, pathAttrs, nlri)
+
+	events, err := ParseUpdate(msg, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if events[0].CommExt[0] != "RT:64496:100" {
+		t.Errorf("expected 'RT:64496:100', got '%s'", events[0].CommExt[0])
+	}
+}
+
+func TestDecodeExtCommunity_UnknownType(t *testing.T) {
+	// Unknown type 0x06, subtype 0x99 → hex fallback
+	data := []byte{0x06, 0x99, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06}
+	extCommAttr := buildPathAttr(0xC0, AttrTypeExtCommunity, data)
+
+	nlri := []byte{24, 10, 0, 0}
+	originAttr := buildPathAttr(0x40, AttrTypeOrigin, []byte{0})
+	nexthopAttr := buildPathAttr(0x40, AttrTypeNextHop, []byte{192, 168, 1, 1})
+	pathAttrs := append(originAttr, append(extCommAttr, nexthopAttr...)...)
+
+	msg := buildBGPUpdate(nil, pathAttrs, nlri)
+
+	events, err := ParseUpdate(msg, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if events[0].CommExt[0] != "0699010203040506" {
+		t.Errorf("expected hex fallback '0699010203040506', got '%s'", events[0].CommExt[0])
+	}
 }
