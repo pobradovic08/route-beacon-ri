@@ -72,6 +72,21 @@ func (w *Writer) FlushBatch(ctx context.Context, routes []*ParsedRoute) error {
 	return nil
 }
 
+// UpsertRouter inserts or updates router metadata from BMP Initiation messages.
+func (w *Writer) UpsertRouter(ctx context.Context, routerID, routerIP, hostname, description string) error {
+	_, err := w.pool.Exec(ctx, `
+		INSERT INTO routers (router_id, router_ip, hostname, description, first_seen, last_seen)
+		VALUES ($1, $2, $3, $4, now(), now())
+		ON CONFLICT (router_id) DO UPDATE SET
+			router_ip = COALESCE(EXCLUDED.router_ip, routers.router_ip),
+			hostname = COALESCE(EXCLUDED.hostname, routers.hostname),
+			description = COALESCE(EXCLUDED.description, routers.description),
+			last_seen = now()`,
+		routerID, nullableString(routerIP), nullableString(hostname), nullableString(description),
+	)
+	return err
+}
+
 func (w *Writer) upsertRoute(ctx context.Context, tx pgx.Tx, r *ParsedRoute) (int64, error) {
 	var attrsJSON []byte
 	if r.Attrs != nil {
@@ -84,9 +99,9 @@ func (w *Writer) upsertRoute(ctx context.Context, tx pgx.Tx, r *ParsedRoute) (in
 
 	tag, err := tx.Exec(ctx, `
 		INSERT INTO current_routes (router_id, table_name, afi, prefix, path_id,
-			nexthop, as_path, origin, localpref, med,
-			communities_std, communities_ext, communities_large, attrs, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, now())
+			nexthop, as_path, origin, localpref, med, origin_asn,
+			communities_std, communities_ext, communities_large, attrs, first_seen, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, now(), now())
 		ON CONFLICT (router_id, table_name, afi, prefix, path_id)
 		DO UPDATE SET
 			nexthop = EXCLUDED.nexthop,
@@ -94,6 +109,7 @@ func (w *Writer) upsertRoute(ctx context.Context, tx pgx.Tx, r *ParsedRoute) (in
 			origin = EXCLUDED.origin,
 			localpref = EXCLUDED.localpref,
 			med = EXCLUDED.med,
+			origin_asn = EXCLUDED.origin_asn,
 			communities_std = EXCLUDED.communities_std,
 			communities_ext = EXCLUDED.communities_ext,
 			communities_large = EXCLUDED.communities_large,
@@ -101,7 +117,7 @@ func (w *Writer) upsertRoute(ctx context.Context, tx pgx.Tx, r *ParsedRoute) (in
 			updated_at = now()`,
 		r.RouterID, r.TableName, r.AFI, r.Prefix, r.PathID,
 		nullableString(r.Nexthop), nullableString(r.ASPath), nullableString(r.Origin),
-		r.LocalPref, r.MED,
+		r.LocalPref, r.MED, r.OriginASN,
 		r.CommStd, r.CommExt, r.CommLarge, attrsJSON,
 	)
 	if err != nil {
