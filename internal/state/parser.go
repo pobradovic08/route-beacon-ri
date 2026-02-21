@@ -131,6 +131,9 @@ func DecodeUnicastPrefix(data []byte, topicAFI int) (*ParsedRoute, error) {
 	r.CommExt = stringArrayField(raw, "ext_community_list")
 	r.CommLarge = stringArrayField(raw, "large_community_list")
 
+	// Fall back to base_attrs for fields goBMP v1.1.0 nests there
+	mergeBaseAttrs(raw, r)
+
 	// Remaining attributes → attrs JSONB
 	r.Attrs = extractRemainingAttrs(raw)
 
@@ -255,6 +258,71 @@ func stringArrayField(m map[string]any, key string) []string {
 	return nil
 }
 
+// mergeBaseAttrs extracts route attributes from the nested base_attrs object
+// that goBMP v1.1.0+ uses, filling in any fields not found at the top level.
+func mergeBaseAttrs(raw map[string]any, r *ParsedRoute) {
+	ba, ok := raw["base_attrs"]
+	if !ok {
+		return
+	}
+	baseAttrs, ok := ba.(map[string]any)
+	if !ok {
+		return
+	}
+
+	if r.ASPath == "" {
+		if v, ok := baseAttrs["as_path"]; ok {
+			switch arr := v.(type) {
+			case []any:
+				parts := make([]string, 0, len(arr))
+				for _, item := range arr {
+					switch n := item.(type) {
+					case float64:
+						parts = append(parts, strconv.FormatInt(int64(n), 10))
+					case string:
+						parts = append(parts, n)
+					}
+				}
+				r.ASPath = strings.Join(parts, " ")
+			case string:
+				r.ASPath = arr
+			}
+		}
+	}
+
+	if r.Origin == "" {
+		r.Origin = stringField(baseAttrs, "origin")
+	}
+
+	if r.Nexthop == "" {
+		r.Nexthop = stringField(baseAttrs, "nexthop")
+	}
+
+	if r.LocalPref == nil {
+		if lp, ok := baseAttrs["local_pref"]; ok {
+			v := int32(int64Field(lp))
+			r.LocalPref = &v
+		}
+	}
+
+	if r.MED == nil {
+		if med, ok := baseAttrs["med"]; ok {
+			v := int32(int64Field(med))
+			r.MED = &v
+		}
+	}
+
+	if r.CommStd == nil {
+		r.CommStd = stringArrayField(baseAttrs, "community_list")
+	}
+	if r.CommExt == nil {
+		r.CommExt = stringArrayField(baseAttrs, "ext_community_list")
+	}
+	if r.CommLarge == nil {
+		r.CommLarge = stringArrayField(baseAttrs, "large_community_list")
+	}
+}
+
 // knownFields are fields already extracted; everything else goes to attrs.
 var knownFields = map[string]bool{
 	"router_hash": true, "router_ip": true, "bmp_router": true,
@@ -264,7 +332,7 @@ var knownFields = map[string]bool{
 	"local_pref": true, "med": true,
 	"community_list": true, "ext_community_list": true, "large_community_list": true,
 	"timestamp": true, "peer_hash": true, "peer_ip": true, "peer_asn": true,
-	"peer_type": true,
+	"peer_type": true, "base_attrs": true,
 }
 
 func extractRemainingAttrs(m map[string]any) map[string]any {
