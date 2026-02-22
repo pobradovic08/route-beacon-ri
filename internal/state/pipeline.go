@@ -308,25 +308,6 @@ func (p *Pipeline) processRawRecord(ctx context.Context, rec *kgo.Record) ([]*Pa
 	finalAction := actionRoute
 
 	for _, parsed := range msgs {
-		// Initiation messages have no per-peer header and no Loc-RIB filter.
-		if parsed.MsgType == bmp.MsgTypeInitiation {
-			routerID := obmpRouterIP
-			if routerID != "" && (parsed.SysName != "" || parsed.SysDescr != "") {
-				if err := p.writer.UpsertRouter(ctx, routerID, routerID, parsed.SysName, parsed.SysDescr); err != nil {
-					p.logger.Error("UpsertRouter failed",
-						zap.String("router_id", routerID),
-						zap.Error(err),
-					)
-				} else {
-					p.logger.Info("router metadata updated from BMP Initiation",
-						zap.String("router_id", routerID),
-						zap.String("sys_name", parsed.SysName),
-					)
-				}
-			}
-			continue
-		}
-
 		if !parsed.IsLocRIB {
 			continue
 		}
