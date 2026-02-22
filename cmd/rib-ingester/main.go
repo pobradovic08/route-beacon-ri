@@ -168,7 +168,7 @@ func runServe() {
 
 	// --- State pipeline ---
 	stateWriter := state.NewWriter(pool, logger.Named("state.writer"))
-	statePipeline := state.NewPipeline(stateWriter, cfg.Ingest.BatchSize, cfg.Ingest.FlushIntervalMs, cfg.Kafka.State.RawMode, cfg.Ingest.MaxPayloadBytes, logger.Named("state.pipeline"))
+	statePipeline := state.NewPipeline(stateWriter, cfg.Ingest.BatchSize, cfg.Ingest.FlushIntervalMs, cfg.Kafka.State.RawMode, cfg.Ingest.MaxPayloadBytes, logger.Named("state.pipeline"), cfg.Routers)
 
 	stateRecords := make(chan []*kgo.Record, cfg.Ingest.ChannelBufferSize)
 	stateFlushed := make(chan []*kgo.Record, cfg.Ingest.ChannelBufferSize)
@@ -202,7 +202,7 @@ func runServe() {
 		cfg.Ingest.StoreRawBytes, cfg.Ingest.StoreRawBytesCompress)
 	historyPipeline := history.NewPipeline(historyWriter,
 		cfg.Ingest.BatchSize, cfg.Ingest.FlushIntervalMs, cfg.Ingest.MaxPayloadBytes,
-		logger.Named("history.pipeline"))
+		logger.Named("history.pipeline"), cfg.Routers)
 
 	historyRecords := make(chan []*kgo.Record, cfg.Ingest.ChannelBufferSize)
 	historyFlushed := make(chan []*kgo.Record, cfg.Ingest.ChannelBufferSize)

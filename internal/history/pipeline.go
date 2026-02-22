@@ -8,6 +8,7 @@ import (
 
 	"github.com/route-beacon/rib-ingester/internal/bgp"
 	"github.com/route-beacon/rib-ingester/internal/bmp"
+	"github.com/route-beacon/rib-ingester/internal/config"
 	"github.com/route-beacon/rib-ingester/internal/metrics"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"go.uber.org/zap"
@@ -20,9 +21,13 @@ type Pipeline struct {
 	maxPayloadBytes int
 	logger          *zap.Logger
 	asnCache        map[string]uint32
+	routerMeta      map[string]config.RouterMeta
 }
 
-func NewPipeline(writer *Writer, batchSize, flushIntervalMs, maxPayloadBytes int, logger *zap.Logger) *Pipeline {
+func NewPipeline(writer *Writer, batchSize, flushIntervalMs, maxPayloadBytes int, logger *zap.Logger, routerMeta map[string]config.RouterMeta) *Pipeline {
+	if routerMeta == nil {
+		routerMeta = make(map[string]config.RouterMeta)
+	}
 	return &Pipeline{
 		writer:          writer,
 		batchSize:       batchSize,
@@ -30,6 +35,7 @@ func NewPipeline(writer *Writer, batchSize, flushIntervalMs, maxPayloadBytes int
 		maxPayloadBytes: maxPayloadBytes,
 		logger:          logger,
 		asnCache:        make(map[string]uint32),
+		routerMeta:      routerMeta,
 	}
 }
 
@@ -218,7 +224,8 @@ func (p *Pipeline) processLocRIBPeerUp(ctx context.Context, rec *kgo.Record, par
 		return
 	}
 
-	if err := UpsertRouter(ctx, p.writer.pool, routerID, routerID, "", "", nil); err != nil {
+	meta := p.routerMeta[routerID]
+	if err := UpsertRouter(ctx, p.writer.pool, routerID, routerID, "", "", nil, meta.Name, meta.Location); err != nil {
 		p.logger.Warn("failed to upsert router from Loc-RIB Peer Up",
 			zap.String("router_id", routerID),
 			zap.Error(err),
@@ -260,7 +267,8 @@ func (p *Pipeline) processPeerUpASN(ctx context.Context, rec *kgo.Record, parsed
 		)
 		return
 	}
-	if err := UpsertRouter(ctx, p.writer.pool, routerID, routerIP, "", "", &asn); err != nil {
+	meta := p.routerMeta[routerID]
+	if err := UpsertRouter(ctx, p.writer.pool, routerID, routerIP, "", "", &asn, meta.Name, meta.Location); err != nil {
 		p.logger.Warn("failed to upsert router ASN from peer up",
 			zap.String("router_id", routerID),
 			zap.Uint32("as_number", parsed.LocalASN),

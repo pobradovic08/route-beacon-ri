@@ -8,6 +8,7 @@ import (
 
 	"github.com/route-beacon/rib-ingester/internal/bgp"
 	"github.com/route-beacon/rib-ingester/internal/bmp"
+	"github.com/route-beacon/rib-ingester/internal/config"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"go.uber.org/zap"
 )
@@ -119,7 +120,7 @@ func wrapOpenBMP(bmpMsg []byte) []byte {
 
 // newTestHistoryPipeline creates a Pipeline with nil writer for testing processRecord.
 func newTestHistoryPipeline() *Pipeline {
-	return NewPipeline(nil, 1000, 200, 16*1024*1024, zap.NewNop())
+	return NewPipeline(nil, 1000, 200, 16*1024*1024, zap.NewNop(), nil)
 }
 
 // wrapOpenBMPV17 wraps a BMP message in an OpenBMP v1.7 frame with a router IP.
@@ -529,6 +530,34 @@ func TestHistoryProcessRecord_PeerUp4ByteASN(t *testing.T) {
 
 	if p.asnCache["10.0.0.1"] != 400000 {
 		t.Errorf("expected asnCache[10.0.0.1]=400000, got %d", p.asnCache["10.0.0.1"])
+	}
+}
+
+func TestHistoryPipeline_RouterMetaStored(t *testing.T) {
+	meta := map[string]config.RouterMeta{
+		"10.0.0.2": {Name: "bgp-router-ceos", Location: "docker-lab"},
+	}
+	p := NewPipeline(nil, 1000, 200, 16*1024*1024, zap.NewNop(), meta)
+
+	got, ok := p.routerMeta["10.0.0.2"]
+	if !ok {
+		t.Fatal("expected routerMeta to contain 10.0.0.2")
+	}
+	if got.Name != "bgp-router-ceos" {
+		t.Errorf("expected Name 'bgp-router-ceos', got %q", got.Name)
+	}
+	if got.Location != "docker-lab" {
+		t.Errorf("expected Location 'docker-lab', got %q", got.Location)
+	}
+}
+
+func TestHistoryPipeline_NilRouterMetaDefaultsToEmptyMap(t *testing.T) {
+	p := NewPipeline(nil, 1000, 200, 16*1024*1024, zap.NewNop(), nil)
+	if p.routerMeta == nil {
+		t.Fatal("expected routerMeta to be initialized, got nil")
+	}
+	if len(p.routerMeta) != 0 {
+		t.Errorf("expected empty routerMeta, got %d entries", len(p.routerMeta))
 	}
 }
 

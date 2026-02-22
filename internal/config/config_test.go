@@ -157,6 +157,77 @@ func TestValidate_ValidTimezone(t *testing.T) {
 	}
 }
 
+func TestLoad_RoutersMapParsed(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "config.yaml")
+	data := `
+kafka:
+  brokers:
+    - "localhost:9092"
+  state:
+    topics:
+      - "t1"
+  history:
+    topics:
+      - "t2"
+postgres:
+  dsn: "postgres://localhost/test"
+routers:
+  10.0.0.2:
+    name: "bgp-router-ceos"
+    location: "docker-lab"
+  10.0.0.3:
+    name: "core-rtr-01"
+    location: "dc1"
+`
+	if err := os.WriteFile(p, []byte(data), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(cfg.Routers) != 2 {
+		t.Fatalf("expected 2 routers, got %d", len(cfg.Routers))
+	}
+	r1, ok := cfg.Routers["10.0.0.2"]
+	if !ok {
+		t.Fatal("expected router 10.0.0.2 in map")
+	}
+	if r1.Name != "bgp-router-ceos" {
+		t.Errorf("expected name 'bgp-router-ceos', got %q", r1.Name)
+	}
+	if r1.Location != "docker-lab" {
+		t.Errorf("expected location 'docker-lab', got %q", r1.Location)
+	}
+	r2, ok := cfg.Routers["10.0.0.3"]
+	if !ok {
+		t.Fatal("expected router 10.0.0.3 in map")
+	}
+	if r2.Name != "core-rtr-01" {
+		t.Errorf("expected name 'core-rtr-01', got %q", r2.Name)
+	}
+	if r2.Location != "dc1" {
+		t.Errorf("expected location 'dc1', got %q", r2.Location)
+	}
+}
+
+func TestLoad_EmptyRoutersMap(t *testing.T) {
+	p := writeMinimalYAML(t)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Routers == nil {
+		// nil is fine — empty map is also fine
+		return
+	}
+	if len(cfg.Routers) != 0 {
+		t.Errorf("expected empty routers map, got %d entries", len(cfg.Routers))
+	}
+}
+
 func writeMinimalYAML(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()

@@ -43,3 +43,8 @@ ingest:
 retention:
   days: 7
   timezone: "UTC"
+
+routers:
+  10.0.0.2:
+    name: "SI1 IGW router #1"
+    location: "Slovenia"
