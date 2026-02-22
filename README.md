@@ -4,7 +4,7 @@ A production-grade Go service that ingests BMP Loc-RIB data from two active/acti
 
 ## Prerequisites
 
-- Go 1.22+
+- Go 1.25+
 - PostgreSQL 15+ (with `btree_gist` extension)
 - Kafka cluster with pre-created topics
 - Two goBMP collectors publishing to Kafka
@@ -100,6 +100,15 @@ Current Loc-RIB state per router/table/AFI/prefix/path_id. Supports LPM queries 
 ### route_events
 Historical route changes (additions/withdrawals) partitioned by day on `ingest_time`. Deduplicated across collectors via SHA256-based `event_id` with `ON CONFLICT DO NOTHING`.
 
+### routers
+Router metadata populated from BMP Initiation messages. Stores router IP, hostname (sysName), AS number, and description (sysDescr). Updated on each new BMP session via UPSERT with COALESCE semantics to avoid overwriting existing values with empty fields.
+
+### route_summary (materialized view)
+Pre-aggregated route counts per router/table/AFI. Refreshed periodically by the maintenance loop using `REFRESH MATERIALIZED VIEW CONCURRENTLY`.
+
+### routers_overview (view)
+Discovers routers from all data sources (`routers`, `rib_sync_status`, `current_routes`) to ensure routers appear in listings even before BMP Initiation is processed. Joins router metadata, route counts, and sync status.
+
 ### rib_sync_status
 Tracks per-router/table/AFI synchronization state including EOR status, session start time, and last message timestamps.
 
@@ -109,6 +118,7 @@ Tracks per-router/table/AFI synchronization state including EOR status, session 
 - **EOR handling**: After End-of-RIB, routes not re-announced since session start are purged from `current_routes`.
 - **Session termination**: When a Loc-RIB peer goes down, all routes and sync status for that router are immediately purged.
 - **LPM queries**: Use `prefix >>= $ip ORDER BY masklen(prefix) DESC LIMIT 1` for longest-prefix match.
+- **Router metadata**: BMP Initiation messages are parsed for sysName/sysDescr TLVs and upserted into the `routers` table. The router IP is extracted from the OpenBMP v1.7 header.
 - **Partition retention**: Run `./rib-ingester maintenance` daily (via systemd timer or cron) to create new partitions and drop those older than the configured retention period.
 
 ## Endpoints
@@ -134,6 +144,12 @@ Arista cEOS (tested with cEOS-lab) sends Add-Path encoded NLRI in BMP Loc-RIB Ro
 RFC 9069 Section 4.1 specifies that for Loc-RIB (peer type 3), the Peer Address is set to zero, but the Peer BGP ID field (per-peer header offset 30) contains the local router's BGP identifier. FRRouting non-standardly populates the Peer Address with the router's address, masking this distinction.
 
 The ingester handles both cases: `RouterIDFromPeerHeader` checks the Peer Address first; if it is all zeros, it falls back to the Peer BGP ID field.
+
+### goBMP: Initiation messages dropped from raw topic ([#354](https://github.com/sbezverk/gobmp/issues/354))
+
+When using goBMP with `-bmp-raw=true`, BMP Initiation (type 4) and Termination (type 5) messages are dropped from the `gobmp.raw` Kafka topic because `produceRawMessage()` requires a per-peer header to construct the OpenBMP v1.7 binary header. Initiation and Termination messages have no per-peer header per RFC 7854 §4.3/§4.5.
+
+**Impact**: The `routers` table will not be populated when consuming only the raw topic. Router metadata collection requires either a fix upstream in goBMP or consuming parsed topics alongside raw.
 
 ## Development
 
