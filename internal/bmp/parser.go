@@ -104,6 +104,14 @@ func parseRouteMonitoring(data []byte, result *ParsedBMP) (*ParsedBMP, error) {
 	result.IsLocRIB = result.PeerType == PeerTypeLocRIB
 	result.HasAddPath = (result.PeerFlags & PeerFlagAddPath) != 0
 
+	// Extract peer identity for non-Loc-RIB peers (types 0/1/2).
+	if !result.IsLocRIB {
+		result.PeerAddress = PeerAddressFromPeerHeader(data)
+		result.PeerAS = PeerASFromPeerHeader(data)
+		result.PeerBGPID = PeerBGPIDFromPeerHeader(data)
+		result.IsPostPolicy = (result.PeerFlags & PeerFlagPostPolicy) != 0
+	}
+
 	// After per-peer header (42 bytes), the BGP message follows.
 	// But for Loc-RIB, we need to extract the BGP UPDATE first, then parse TLVs after.
 	bgpStart := 42
@@ -154,6 +162,14 @@ func parsePeerDown(data []byte, result *ParsedBMP) (*ParsedBMP, error) {
 	result.IsLocRIB = result.PeerType == PeerTypeLocRIB
 	result.HasAddPath = (result.PeerFlags & PeerFlagAddPath) != 0
 
+	// Extract peer identity for non-Loc-RIB peers (types 0/1/2).
+	if !result.IsLocRIB {
+		result.PeerAddress = PeerAddressFromPeerHeader(data)
+		result.PeerAS = PeerASFromPeerHeader(data)
+		result.PeerBGPID = PeerBGPIDFromPeerHeader(data)
+		result.IsPostPolicy = (result.PeerFlags & PeerFlagPostPolicy) != 0
+	}
+
 	if len(data) > 42 {
 		result.PeerDownReason = data[42]
 	}
@@ -178,6 +194,15 @@ func parsePeerUp(data []byte, result *ParsedBMP) (*ParsedBMP, error) {
 	result.PeerFlags = data[1]
 	result.IsLocRIB = result.PeerType == PeerTypeLocRIB
 	result.HasAddPath = (result.PeerFlags & PeerFlagAddPath) != 0
+
+	// Extract peer identity for non-Loc-RIB peers (types 0/1/2).
+	if !result.IsLocRIB {
+		result.PeerAddress = PeerAddressFromPeerHeader(data)
+		result.PeerAS = PeerASFromPeerHeader(data)
+		result.PeerBGPID = PeerBGPIDFromPeerHeader(data)
+		result.IsPostPolicy = (result.PeerFlags & PeerFlagPostPolicy) != 0
+	}
+
 	if result.IsLocRIB {
 		// RFC 9069 Section 4.4: For Loc-RIB Peer Up, the Sent Open and
 		// Received Open fields are empty (zero-length), so TLVs start
@@ -362,6 +387,64 @@ func find4ByteASNCapability(optParams []byte) uint32 {
 		offset += paramLen
 	}
 	return 0
+}
+
+// PeerAddressFromPeerHeader extracts the Peer Address from a BMP per-peer header.
+// Returns the address as a string. For IPv4, BMP encodes as 12 zero bytes + 4 IPv4 bytes.
+// Returns "" if the address is all zeros (Loc-RIB).
+func PeerAddressFromPeerHeader(data []byte) string {
+	if len(data) < PerPeerHeaderSize {
+		return ""
+	}
+	addr := data[10:26]
+	allZero := true
+	for _, b := range addr {
+		if b != 0 {
+			allZero = false
+			break
+		}
+	}
+	if allZero {
+		return ""
+	}
+	isV4 := true
+	for _, b := range addr[:12] {
+		if b != 0 {
+			isV4 = false
+			break
+		}
+	}
+	if isV4 {
+		return net.IP(addr[12:16]).String()
+	}
+	return net.IP(addr).String()
+}
+
+// PeerASFromPeerHeader extracts the 4-byte Peer AS from a BMP per-peer header.
+func PeerASFromPeerHeader(data []byte) uint32 {
+	if len(data) < PerPeerHeaderSize {
+		return 0
+	}
+	return binary.BigEndian.Uint32(data[26:30])
+}
+
+// PeerBGPIDFromPeerHeader extracts the Peer BGP ID (4-byte IPv4) from offset 30-34.
+func PeerBGPIDFromPeerHeader(data []byte) string {
+	if len(data) < PerPeerHeaderSize {
+		return ""
+	}
+	bgpID := data[30:34]
+	allZero := true
+	for _, b := range bgpID {
+		if b != 0 {
+			allZero = false
+			break
+		}
+	}
+	if allZero {
+		return ""
+	}
+	return net.IP(bgpID).String()
 }
 
 // RouterIDFromPeerHeader extracts the router identifier from a BMP per-peer header.

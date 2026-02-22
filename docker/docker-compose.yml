@@ -9,6 +9,7 @@ services:
       - ../migrations/0001_init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
       - ../migrations/0003_routers.sql:/docker-entrypoint-initdb.d/03_routers.sql:ro
       - ../migrations/0004_router_metadata.sql:/docker-entrypoint-initdb.d/04_router_metadata.sql:ro
+      - ../migrations/0005_adj_rib_in.sql:/docker-entrypoint-initdb.d/05_adj_rib_in.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U rib -d rib"]
       interval: 2s

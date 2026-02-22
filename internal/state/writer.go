@@ -283,6 +283,254 @@ func (w *Writer) UpdateSessionStart(ctx context.Context, routerID, tableName str
 	return err
 }
 
+// FlushAdjRibInBatch writes a batch of Adj-RIB-In routes to adj_rib_in within a transaction.
+func (w *Writer) FlushAdjRibInBatch(ctx context.Context, routes []*ParsedRoute) error {
+	if len(routes) == 0 {
+		return nil
+	}
+
+	start := time.Now()
+
+	tx, err := w.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	var upserted, deleted int64
+
+	for _, r := range routes {
+		switch r.Action {
+		case "A":
+			n, err := w.upsertAdjRibInRoute(ctx, tx, r)
+			if err != nil {
+				return fmt.Errorf("upsert adj_rib_in route: %w", err)
+			}
+			upserted += n
+		case "D":
+			n, err := w.deleteAdjRibInRoute(ctx, tx, r)
+			if err != nil {
+				return fmt.Errorf("delete adj_rib_in route: %w", err)
+			}
+			deleted += n
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit adj_rib_in tx: %w", err)
+	}
+
+	dur := time.Since(start).Seconds()
+	metrics.DBWriteDuration.WithLabelValues("state", "adj_batch").Observe(dur)
+	metrics.DBRowsAffectedTotal.WithLabelValues("state", "adj_rib_in", "upsert").Add(float64(upserted))
+	metrics.DBRowsAffectedTotal.WithLabelValues("state", "adj_rib_in", "delete").Add(float64(deleted))
+	metrics.BatchSize.WithLabelValues("state_adj").Observe(float64(len(routes)))
+
+	return nil
+}
+
+func (w *Writer) upsertAdjRibInRoute(ctx context.Context, tx pgx.Tx, r *ParsedRoute) (int64, error) {
+	var attrsJSON []byte
+	if r.Attrs != nil {
+		var err error
+		attrsJSON, err = json.Marshal(r.Attrs)
+		if err != nil {
+			return 0, fmt.Errorf("marshal attrs: %w", err)
+		}
+	}
+
+	tag, err := tx.Exec(ctx, `
+		INSERT INTO adj_rib_in (router_id, peer_address, peer_asn, peer_bgp_id, is_post_policy,
+			table_name, afi, prefix, path_id,
+			nexthop, as_path, origin, localpref, med, origin_asn,
+			communities_std, communities_ext, communities_large, attrs,
+			first_seen, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, now(), now())
+		ON CONFLICT (router_id, peer_address, is_post_policy, table_name, afi, prefix, path_id)
+		DO UPDATE SET
+			peer_asn = EXCLUDED.peer_asn,
+			peer_bgp_id = EXCLUDED.peer_bgp_id,
+			nexthop = EXCLUDED.nexthop,
+			as_path = EXCLUDED.as_path,
+			origin = EXCLUDED.origin,
+			localpref = EXCLUDED.localpref,
+			med = EXCLUDED.med,
+			origin_asn = EXCLUDED.origin_asn,
+			communities_std = EXCLUDED.communities_std,
+			communities_ext = EXCLUDED.communities_ext,
+			communities_large = EXCLUDED.communities_large,
+			attrs = EXCLUDED.attrs,
+			updated_at = now()`,
+		r.RouterID, r.PeerAddress, r.PeerAS, r.PeerBGPID, r.IsPostPolicy,
+		r.TableName, r.AFI, r.Prefix, r.PathID,
+		nullableString(r.Nexthop), nullableString(r.ASPath), nullableString(r.Origin),
+		r.LocalPref, r.MED, r.OriginASN,
+		r.CommStd, r.CommExt, r.CommLarge, attrsJSON,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+func (w *Writer) deleteAdjRibInRoute(ctx context.Context, tx pgx.Tx, r *ParsedRoute) (int64, error) {
+	tag, err := tx.Exec(ctx,
+		`DELETE FROM adj_rib_in WHERE router_id = $1 AND peer_address = $2 AND is_post_policy = $3 AND table_name = $4 AND afi = $5 AND prefix = $6 AND path_id = $7`,
+		r.RouterID, r.PeerAddress, r.IsPostPolicy, r.TableName, r.AFI, r.Prefix, r.PathID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+// HandleAdjRibInPeerDown removes all adj_rib_in routes and sync status for a specific peer.
+func (w *Writer) HandleAdjRibInPeerDown(ctx context.Context, routerID, peerAddress string) error {
+	start := time.Now()
+
+	tag, err := w.pool.Exec(ctx,
+		`DELETE FROM adj_rib_in WHERE router_id = $1 AND peer_address = $2`,
+		routerID, peerAddress,
+	)
+	if err != nil {
+		return fmt.Errorf("adj_rib_in peer down: %w", err)
+	}
+
+	_, err = w.pool.Exec(ctx,
+		`DELETE FROM adj_rib_in_sync_status WHERE router_id = $1 AND peer_address = $2`,
+		routerID, peerAddress,
+	)
+	if err != nil {
+		return fmt.Errorf("adj_rib_in_sync_status peer down: %w", err)
+	}
+
+	dur := time.Since(start).Seconds()
+	metrics.DBWriteDuration.WithLabelValues("state", "adj_peer_down").Observe(dur)
+	purged := tag.RowsAffected()
+	if purged > 0 {
+		metrics.RoutesPurgedTotal.WithLabelValues("adj_peer_down").Add(float64(purged))
+	}
+
+	w.logger.Info("purged adj_rib_in routes on peer down",
+		zap.String("router_id", routerID),
+		zap.String("peer_address", peerAddress),
+		zap.Int64("purged", purged),
+	)
+
+	return nil
+}
+
+// HandleAdjRibInSessionTermination removes ALL adj_rib_in routes and sync status for a router
+// (called when BMP session terminates — Loc-RIB peer down or termination message).
+func (w *Writer) HandleAdjRibInSessionTermination(ctx context.Context, routerID string) error {
+	start := time.Now()
+
+	tag, err := w.pool.Exec(ctx,
+		`DELETE FROM adj_rib_in WHERE router_id = $1`,
+		routerID,
+	)
+	if err != nil {
+		return fmt.Errorf("adj_rib_in session termination: %w", err)
+	}
+
+	_, err = w.pool.Exec(ctx,
+		`DELETE FROM adj_rib_in_sync_status WHERE router_id = $1`,
+		routerID,
+	)
+	if err != nil {
+		return fmt.Errorf("adj_rib_in_sync_status session termination: %w", err)
+	}
+
+	dur := time.Since(start).Seconds()
+	metrics.DBWriteDuration.WithLabelValues("state", "adj_session_termination").Observe(dur)
+	purged := tag.RowsAffected()
+	if purged > 0 {
+		metrics.RoutesPurgedTotal.WithLabelValues("adj_session_down").Add(float64(purged))
+	}
+
+	w.logger.Info("purged all adj_rib_in routes on session termination",
+		zap.String("router_id", routerID),
+		zap.Int64("purged", purged),
+	)
+
+	return nil
+}
+
+// UpdateAdjRibInSessionStart records session start for stale route tracking.
+// Called on non-Loc-RIB Peer Up.
+func (w *Writer) UpdateAdjRibInSessionStart(ctx context.Context, routerID, peerAddress string, afi int) error {
+	_, err := w.pool.Exec(ctx, `
+		INSERT INTO adj_rib_in_sync_status (router_id, peer_address, afi, session_start_time, eor_seen, updated_at)
+		VALUES ($1, $2, $3, now(), false, now())
+		ON CONFLICT (router_id, peer_address, afi)
+		DO UPDATE SET session_start_time = now(), eor_seen = false, eor_time = NULL, updated_at = now()`,
+		routerID, peerAddress, afi,
+	)
+	return err
+}
+
+// HandleAdjRibInEOR updates sync status and purges stale adj_rib_in routes
+// after End-of-RIB for a specific (router, peer, table, afi) scope.
+func (w *Writer) HandleAdjRibInEOR(ctx context.Context, routerID, peerAddress, tableName string, afi int) error {
+	start := time.Now()
+
+	tx, err := w.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// Update EOR status.
+	_, err = tx.Exec(ctx, `
+		UPDATE adj_rib_in_sync_status SET eor_seen = true, eor_time = now(), updated_at = now()
+		WHERE router_id = $1 AND peer_address = $2 AND afi = $3`,
+		routerID, peerAddress, afi,
+	)
+	if err != nil {
+		return fmt.Errorf("update adj eor status: %w", err)
+	}
+
+	// Get session_start_time for stale route purge.
+	var sessionStart *time.Time
+	err = tx.QueryRow(ctx,
+		`SELECT session_start_time FROM adj_rib_in_sync_status WHERE router_id = $1 AND peer_address = $2 AND afi = $3`,
+		routerID, peerAddress, afi,
+	).Scan(&sessionStart)
+	if err != nil {
+		return fmt.Errorf("get adj session_start_time: %w", err)
+	}
+
+	if sessionStart != nil {
+		tag, err := tx.Exec(ctx,
+			`DELETE FROM adj_rib_in WHERE router_id = $1 AND peer_address = $2 AND table_name = $3 AND afi = $4 AND updated_at < $5`,
+			routerID, peerAddress, tableName, afi, *sessionStart,
+		)
+		if err != nil {
+			return fmt.Errorf("purge stale adj routes: %w", err)
+		}
+		purged := tag.RowsAffected()
+		if purged > 0 {
+			metrics.RoutesPurgedTotal.WithLabelValues("adj_eor_stale").Add(float64(purged))
+			w.logger.Info("purged stale adj_rib_in routes after EOR",
+				zap.String("router_id", routerID),
+				zap.String("peer_address", peerAddress),
+				zap.String("table_name", tableName),
+				zap.Int("afi", afi),
+				zap.Int64("purged", purged),
+			)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit adj eor tx: %w", err)
+	}
+
+	dur := time.Since(start).Seconds()
+	metrics.DBWriteDuration.WithLabelValues("state", "adj_eor").Observe(dur)
+
+	return nil
+}
+
 func nullableString(s string) any {
 	if s == "" {
 		return nil

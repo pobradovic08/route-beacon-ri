@@ -1079,6 +1079,259 @@ func TestParsePeerUp_LocRIB_NoBGPID(t *testing.T) {
 	}
 }
 
+// --- Adj-RIB-In peer extraction tests ---
+
+func TestPeerAddressFromPeerHeader_IPv4(t *testing.T) {
+	hdr := make([]byte, PerPeerHeaderSize)
+	hdr[0] = PeerTypeGlobal
+	// BMP IPv4 encoding: 12 zero bytes + 4 IPv4 bytes at offset 10
+	hdr[22] = 172
+	hdr[23] = 30
+	hdr[24] = 0
+	hdr[25] = 30
+
+	addr := PeerAddressFromPeerHeader(hdr)
+	if addr != "172.30.0.30" {
+		t.Errorf("expected '172.30.0.30', got '%s'", addr)
+	}
+}
+
+func TestPeerAddressFromPeerHeader_IPv6(t *testing.T) {
+	hdr := make([]byte, PerPeerHeaderSize)
+	hdr[0] = PeerTypeGlobal
+	ipv6 := net.ParseIP("2001:db8::1")
+	copy(hdr[10:26], ipv6.To16())
+
+	addr := PeerAddressFromPeerHeader(hdr)
+	if addr != "2001:db8::1" {
+		t.Errorf("expected '2001:db8::1', got '%s'", addr)
+	}
+}
+
+func TestPeerAddressFromPeerHeader_AllZeros(t *testing.T) {
+	hdr := make([]byte, PerPeerHeaderSize)
+	hdr[0] = PeerTypeLocRIB
+	// All zeros for Loc-RIB → empty string
+	addr := PeerAddressFromPeerHeader(hdr)
+	if addr != "" {
+		t.Errorf("expected empty string for all-zero address, got '%s'", addr)
+	}
+}
+
+func TestPeerAddressFromPeerHeader_TooShort(t *testing.T) {
+	addr := PeerAddressFromPeerHeader([]byte{0, 0, 0})
+	if addr != "" {
+		t.Errorf("expected empty string for short data, got '%s'", addr)
+	}
+}
+
+func TestPeerASFromPeerHeader(t *testing.T) {
+	hdr := make([]byte, PerPeerHeaderSize)
+	hdr[0] = PeerTypeGlobal
+	binary.BigEndian.PutUint32(hdr[26:30], 65001)
+
+	asn := PeerASFromPeerHeader(hdr)
+	if asn != 65001 {
+		t.Errorf("expected ASN 65001, got %d", asn)
+	}
+}
+
+func TestPeerASFromPeerHeader_TooShort(t *testing.T) {
+	asn := PeerASFromPeerHeader([]byte{0, 0, 0})
+	if asn != 0 {
+		t.Errorf("expected 0 for short data, got %d", asn)
+	}
+}
+
+func TestPeerBGPIDFromPeerHeader(t *testing.T) {
+	hdr := make([]byte, PerPeerHeaderSize)
+	hdr[0] = PeerTypeGlobal
+	hdr[30] = 10
+	hdr[31] = 0
+	hdr[32] = 0
+	hdr[33] = 1
+
+	bgpID := PeerBGPIDFromPeerHeader(hdr)
+	if bgpID != "10.0.0.1" {
+		t.Errorf("expected '10.0.0.1', got '%s'", bgpID)
+	}
+}
+
+func TestPeerBGPIDFromPeerHeader_AllZeros(t *testing.T) {
+	hdr := make([]byte, PerPeerHeaderSize)
+	bgpID := PeerBGPIDFromPeerHeader(hdr)
+	if bgpID != "" {
+		t.Errorf("expected empty string for all-zero BGP ID, got '%s'", bgpID)
+	}
+}
+
+func TestPeerBGPIDFromPeerHeader_TooShort(t *testing.T) {
+	bgpID := PeerBGPIDFromPeerHeader([]byte{0, 0, 0})
+	if bgpID != "" {
+		t.Errorf("expected empty string for short data, got '%s'", bgpID)
+	}
+}
+
+func TestIsPostPolicy_Flag(t *testing.T) {
+	bgp := buildMinimalBGPUpdate()
+
+	// Pre-policy (L=0): no PeerFlagPostPolicy set
+	bmpPre := buildBMPRouteMonitoring(PeerTypeGlobal, bgp)
+	parsedPre, err := Parse(bmpPre)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if parsedPre.IsPostPolicy {
+		t.Error("expected IsPostPolicy=false when L flag not set")
+	}
+
+	// Post-policy (L=1): set PeerFlagPostPolicy
+	bmpPost := buildBMPRouteMonitoring(PeerTypeGlobal, bgp)
+	bmpPost[7] = PeerFlagPostPolicy // peer_flags at offset 7 (common header 6 + flags at 1)
+	parsedPost, err := Parse(bmpPost)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !parsedPost.IsPostPolicy {
+		t.Error("expected IsPostPolicy=true when L flag is set")
+	}
+}
+
+func TestParse_NonLocRIB_PeerFieldsExtracted(t *testing.T) {
+	bgp := buildMinimalBGPUpdate()
+	bmpMsg := buildBMPRouteMonitoring(PeerTypeGlobal, bgp)
+
+	// Set peer address: 172.30.0.30 at per-peer header offset 10 (BMP offset 6+10=16)
+	// BMP IPv4: 12 zero bytes + 4 IPv4 bytes
+	bmpMsg[6+22] = 172
+	bmpMsg[6+23] = 30
+	bmpMsg[6+24] = 0
+	bmpMsg[6+25] = 30
+
+	// Set peer AS: 65001 at offset 6+26
+	binary.BigEndian.PutUint32(bmpMsg[6+26:6+30], 65001)
+
+	// Set peer BGP ID: 10.0.0.1 at offset 6+30
+	bmpMsg[6+30] = 10
+	bmpMsg[6+31] = 0
+	bmpMsg[6+32] = 0
+	bmpMsg[6+33] = 1
+
+	// Set L-flag for post-policy
+	bmpMsg[7] = PeerFlagPostPolicy
+
+	parsed, err := Parse(bmpMsg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if parsed.PeerAddress != "172.30.0.30" {
+		t.Errorf("expected PeerAddress='172.30.0.30', got '%s'", parsed.PeerAddress)
+	}
+	if parsed.PeerAS != 65001 {
+		t.Errorf("expected PeerAS=65001, got %d", parsed.PeerAS)
+	}
+	if parsed.PeerBGPID != "10.0.0.1" {
+		t.Errorf("expected PeerBGPID='10.0.0.1', got '%s'", parsed.PeerBGPID)
+	}
+	if !parsed.IsPostPolicy {
+		t.Error("expected IsPostPolicy=true")
+	}
+}
+
+func TestParse_LocRIB_NoPeerFieldsExtracted(t *testing.T) {
+	bgp := buildMinimalBGPUpdate()
+	bmpMsg := buildBMPRouteMonitoring(PeerTypeLocRIB, bgp)
+
+	parsed, err := Parse(bmpMsg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if parsed.PeerAddress != "" {
+		t.Errorf("expected empty PeerAddress for Loc-RIB, got '%s'", parsed.PeerAddress)
+	}
+	if parsed.PeerAS != 0 {
+		t.Errorf("expected PeerAS=0 for Loc-RIB, got %d", parsed.PeerAS)
+	}
+	if parsed.PeerBGPID != "" {
+		t.Errorf("expected empty PeerBGPID for Loc-RIB, got '%s'", parsed.PeerBGPID)
+	}
+	if parsed.IsPostPolicy {
+		t.Error("expected IsPostPolicy=false for Loc-RIB")
+	}
+}
+
+func TestParsePeerDown_NonLocRIB_PeerFieldsExtracted(t *testing.T) {
+	totalLen := 6 + 42 + 1
+	msg := make([]byte, totalLen)
+	msg[0] = BMPVersion
+	binary.BigEndian.PutUint32(msg[1:5], uint32(totalLen))
+	msg[5] = MsgTypePeerDown
+	msg[6] = PeerTypeGlobal
+	msg[7] = PeerFlagPostPolicy
+
+	// Peer address: 192.168.1.1
+	msg[6+22] = 192
+	msg[6+23] = 168
+	msg[6+24] = 1
+	msg[6+25] = 1
+
+	// Peer AS: 65002
+	binary.BigEndian.PutUint32(msg[6+26:6+30], 65002)
+
+	// Peer BGP ID: 10.0.0.2
+	msg[6+30] = 10
+	msg[6+31] = 0
+	msg[6+32] = 0
+	msg[6+33] = 2
+
+	parsed, err := Parse(msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if parsed.PeerAddress != "192.168.1.1" {
+		t.Errorf("expected PeerAddress='192.168.1.1', got '%s'", parsed.PeerAddress)
+	}
+	if parsed.PeerAS != 65002 {
+		t.Errorf("expected PeerAS=65002, got %d", parsed.PeerAS)
+	}
+	if parsed.PeerBGPID != "10.0.0.2" {
+		t.Errorf("expected PeerBGPID='10.0.0.2', got '%s'", parsed.PeerBGPID)
+	}
+	if !parsed.IsPostPolicy {
+		t.Error("expected IsPostPolicy=true")
+	}
+}
+
+func TestParsePeerUp_NonLocRIB_PeerFieldsExtracted(t *testing.T) {
+	msg := buildBMPPeerUp(PeerTypeGlobal, 65001, false)
+	// Set peer address: 10.20.30.40
+	msg[6+22] = 10
+	msg[6+23] = 20
+	msg[6+24] = 30
+	msg[6+25] = 40
+	// Set peer AS: 65003
+	binary.BigEndian.PutUint32(msg[6+26:6+30], 65003)
+	// Set peer BGP ID: 10.0.0.3
+	msg[6+30] = 10
+	msg[6+31] = 0
+	msg[6+32] = 0
+	msg[6+33] = 3
+
+	parsed, err := Parse(msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if parsed.PeerAddress != "10.20.30.40" {
+		t.Errorf("expected PeerAddress='10.20.30.40', got '%s'", parsed.PeerAddress)
+	}
+	if parsed.PeerAS != 65003 {
+		t.Errorf("expected PeerAS=65003, got %d", parsed.PeerAS)
+	}
+	if parsed.PeerBGPID != "10.0.0.3" {
+		t.Errorf("expected PeerBGPID='10.0.0.3', got '%s'", parsed.PeerBGPID)
+	}
+}
+
 func TestParsePeerUp_NonLocRIB_WrongBGPType(t *testing.T) {
 	// Build a non-Loc-RIB Peer Up where the Sent OPEN has BGP type != 1.
 	msg := buildBMPPeerUp(PeerTypeGlobal, 65001, false)

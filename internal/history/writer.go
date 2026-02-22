@@ -42,12 +42,17 @@ func NewWriter(pool *pgxpool.Pool, logger *zap.Logger, storeRawBytes, compressRa
 
 // HistoryRow represents a single row to insert into route_events.
 type HistoryRow struct {
-	EventID   []byte // 32-byte SHA256
-	RouterID  string
-	TableName string
-	Event     *bgp.RouteEvent
-	BMPRaw    []byte // Optional raw BMP bytes
-	Topic     string // For dedup metric labeling
+	EventID      []byte // 32-byte SHA256
+	RouterID     string
+	TableName    string
+	Event        *bgp.RouteEvent
+	BMPRaw       []byte // Optional raw BMP bytes
+	Topic        string // For dedup metric labeling
+	PeerAddress  string // Peer's IP address (empty for Loc-RIB)
+	PeerAS       uint32 // Peer's ASN (0 for Loc-RIB)
+	PeerBGPID    string // Peer's BGP Identifier (empty for Loc-RIB)
+	IsPostPolicy bool
+	IsLocRIB     bool
 }
 
 // FlushBatch inserts a batch of history rows into route_events.
@@ -68,8 +73,10 @@ func (w *Writer) FlushBatch(ctx context.Context, rows []*HistoryRow) (int64, err
 	const insertSQL = `
 		INSERT INTO route_events (event_id, ingest_time, router_id, table_name, afi,
 			prefix, path_id, action, nexthop, as_path, origin, localpref, med,
-			origin_asn, communities_std, communities_ext, communities_large, attrs, bmp_raw)
-		VALUES ($1, now(), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+			origin_asn, communities_std, communities_ext, communities_large, attrs, bmp_raw,
+			peer_address, peer_asn, peer_bgp_id, is_post_policy)
+		VALUES ($1, now(), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
+			$19, $20, $21, $22)
 		ON CONFLICT (event_id, ingest_time) DO NOTHING`
 
 	batch := &pgx.Batch{}
@@ -88,6 +95,17 @@ func (w *Writer) FlushBatch(ctx context.Context, rows []*HistoryRow) (int64, err
 			}
 		}
 
+		// For Loc-RIB rows, peer columns are NULL.
+		var peerAddr, peerBGPID any
+		var peerASN any
+		var isPostPolicy any
+		if !row.IsLocRIB && row.PeerAddress != "" {
+			peerAddr = row.PeerAddress
+			peerASN = int64(row.PeerAS)
+			peerBGPID = nilIfEmpty(row.PeerBGPID)
+			isPostPolicy = row.IsPostPolicy
+		}
+
 		batch.Queue(insertSQL,
 			row.EventID, row.RouterID, row.TableName, row.Event.AFI,
 			row.Event.Prefix, nilIfZero(row.Event.PathID), row.Event.Action,
@@ -96,6 +114,7 @@ func (w *Writer) FlushBatch(ctx context.Context, rows []*HistoryRow) (int64, err
 			bgp.OriginASN(row.Event.ASPath),
 			row.Event.CommStd, row.Event.CommExt, row.Event.CommLarge,
 			attrsJSON, rawBytes,
+			peerAddr, peerASN, peerBGPID, isPostPolicy,
 		)
 	}
 

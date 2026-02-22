@@ -142,7 +142,7 @@ func (p *Pipeline) processRecord(ctx context.Context, rec *kgo.Record) []*Histor
 			}
 			continue
 		}
-		if !parsed.IsLocRIB || parsed.MsgType != bmp.MsgTypeRouteMonitoring || parsed.BGPData == nil {
+		if parsed.MsgType != bmp.MsgTypeRouteMonitoring || parsed.BGPData == nil {
 			continue
 		}
 
@@ -172,24 +172,36 @@ func (p *Pipeline) processRecord(ctx context.Context, rec *kgo.Record) []*Histor
 			continue
 		}
 
-		// Extract router ID from BMP per-peer header. For Loc-RIB
-		// (RFC 9069), RouterIDFromPeerHeader reads the Peer BGP ID
-		// field since the Peer Address is zero. Fall back to the
-		// OpenBMP v1.7 header's router IP if still empty.
-		peerHdrOffset := parsed.Offset + bmp.CommonHeaderSize
-		routerID := bmp.RouterIDFromPeerHeader(bmpBytes[peerHdrOffset:])
-		if routerID == "" || routerID == "::" || routerID == "0.0.0.0" {
-			if obmpRouterIP != "" {
-				routerID = obmpRouterIP
+		// Router ID: For Loc-RIB, use per-peer header BGP ID. For
+		// non-Loc-RIB, use OBMP header router IP (the BMP speaker).
+		var routerID string
+		if parsed.IsLocRIB {
+			peerHdrOffset := parsed.Offset + bmp.CommonHeaderSize
+			routerID = bmp.RouterIDFromPeerHeader(bmpBytes[peerHdrOffset:])
+			if routerID == "" || routerID == "::" || routerID == "0.0.0.0" {
+				if obmpRouterIP != "" {
+					routerID = obmpRouterIP
+				}
 			}
+		} else {
+			routerID = obmpRouterIP
+		}
+
+		tableName := parsed.TableName
+		if !parsed.IsLocRIB && tableName == "UNKNOWN" {
+			tableName = ""
 		}
 
 		for _, ev := range events {
-			// Per-prefix event_id: hash BMP msg bytes + prefix + action.
-			// Use explicit allocation instead of append(bmpMsgBytes, ...) to
-			// avoid corrupting the underlying bmpBytes array when bmpMsgBytes
-			// is a sub-slice with excess capacity.
-			suffix := []byte(ev.Prefix + "/" + ev.Action)
+			// Per-prefix event_id: hash BMP msg bytes + suffix.
+			// For non-Loc-RIB, include peer_address in the hash to
+			// distinguish the same prefix from different peers.
+			var suffix []byte
+			if !parsed.IsLocRIB {
+				suffix = []byte(parsed.PeerAddress + "/" + ev.Prefix + "/" + ev.Action)
+			} else {
+				suffix = []byte(ev.Prefix + "/" + ev.Action)
+			}
 			perPrefixData := make([]byte, len(bmpMsgBytes)+len(suffix))
 			copy(perPrefixData, bmpMsgBytes)
 			copy(perPrefixData[len(bmpMsgBytes):], suffix)
@@ -199,12 +211,17 @@ func (p *Pipeline) processRecord(ctx context.Context, rec *kgo.Record) []*Histor
 			metrics.KafkaMessagesTotal.WithLabelValues("history", rec.Topic, afiStr, ev.Action).Inc()
 
 			rows = append(rows, &HistoryRow{
-				EventID:   rowEventID,
-				RouterID:  routerID,
-				TableName: parsed.TableName,
-				Event:     ev,
-				BMPRaw:    bmpMsgBytes,
-				Topic:     rec.Topic,
+				EventID:      rowEventID,
+				RouterID:     routerID,
+				TableName:    tableName,
+				Event:        ev,
+				BMPRaw:       bmpMsgBytes,
+				Topic:        rec.Topic,
+				PeerAddress:  parsed.PeerAddress,
+				PeerAS:       parsed.PeerAS,
+				PeerBGPID:    parsed.PeerBGPID,
+				IsPostPolicy: parsed.IsPostPolicy,
+				IsLocRIB:     parsed.IsLocRIB,
 			})
 		}
 	}

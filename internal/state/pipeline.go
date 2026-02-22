@@ -43,6 +43,7 @@ func NewPipeline(writer *Writer, batchSize int, flushIntervalMs int, rawMode boo
 // It returns the records that were successfully flushed for offset commit.
 func (p *Pipeline) Run(ctx context.Context, records <-chan []*kgo.Record, flushed chan<- []*kgo.Record) {
 	var batch []*ParsedRoute
+	var adjBatch []*ParsedRoute
 	var batchRecords []*kgo.Record
 	ticker := time.NewTicker(p.flushInterval)
 	defer ticker.Stop()
@@ -55,7 +56,7 @@ func (p *Pipeline) Run(ctx context.Context, records <-chan []*kgo.Record, flushe
 			if len(batchRecords) > 0 {
 				shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
-				if err := p.flush(shutdownCtx, batch, batchRecords, flushed); err != nil {
+				if err := p.flushAll(shutdownCtx, batch, adjBatch, batchRecords, flushed); err != nil {
 					p.logger.Error("final flush failed", zap.Error(err))
 				}
 			}
@@ -66,7 +67,7 @@ func (p *Pipeline) Run(ctx context.Context, records <-chan []*kgo.Record, flushe
 				if len(batchRecords) > 0 {
 					shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 					defer cancel()
-					if err := p.flush(shutdownCtx, batch, batchRecords, flushed); err != nil {
+					if err := p.flushAll(shutdownCtx, batch, adjBatch, batchRecords, flushed); err != nil {
 						p.logger.Error("final flush failed", zap.Error(err))
 					}
 				}
@@ -129,11 +130,6 @@ func (p *Pipeline) Run(ctx context.Context, records <-chan []*kgo.Record, flushe
 					}
 				case actionPeerDown:
 					// Flush pending routes to DB before session termination.
-					// If flush fails, keep batch for retry and skip termination
-					// so the record is re-consumed on next restart. This means
-					// the PeerDown event may be replayed, which is safe because
-					// HandleSessionTermination is idempotent (DELETE is a no-op
-					// for already-removed rows).
 					if len(batch) > 0 {
 						if err := p.writer.FlushBatch(ctx, batch); err != nil {
 							p.logger.Error("pre-peerdown flush failed", zap.Error(err))
@@ -144,9 +140,14 @@ func (p *Pipeline) Run(ctx context.Context, records <-chan []*kgo.Record, flushe
 					if err := p.writer.HandleSessionTermination(ctx, routes[0].RouterID, routes[0].TableName); err != nil {
 						p.logger.Error("session termination failed", zap.Error(err))
 					} else {
+						// Also purge all adj_rib_in for the router since BMP session loss
+						// means all peer monitoring data is stale.
+						if err := p.writer.HandleAdjRibInSessionTermination(ctx, routes[0].RouterID); err != nil {
+							p.logger.Error("adj_rib_in session purge failed", zap.Error(err))
+						}
+						adjBatch = nil // Clear any pending adj routes for this router.
 						batchRecords = append(batchRecords, rec)
 						if len(batchRecords) > 0 {
-							// Session termination succeeded — now safe to commit offsets.
 							select {
 							case flushed <- batchRecords:
 							case <-ctx.Done():
@@ -154,14 +155,57 @@ func (p *Pipeline) Run(ctx context.Context, records <-chan []*kgo.Record, flushe
 							batchRecords = nil
 						}
 					}
+
+				case actionAdjRibInRoute:
+					batchRecords = append(batchRecords, rec)
+					adjBatch = append(adjBatch, routes...)
+
+				case actionAdjRibInEOR:
+					// Flush pending adj_rib_in routes, then purge stale.
+					if len(adjBatch) > 0 {
+						if err := p.writer.FlushAdjRibInBatch(ctx, adjBatch); err != nil {
+							p.logger.Error("pre-adj-eor flush failed", zap.Error(err))
+							continue
+						}
+						adjBatch = nil
+					}
+					eorFailed := false
+					for _, r := range routes {
+						if !r.IsEOR {
+							continue
+						}
+						if err := p.writer.HandleAdjRibInEOR(ctx, r.RouterID, r.PeerAddress, r.TableName, r.AFI); err != nil {
+							p.logger.Error("adj_rib_in EOR handling failed", zap.Error(err))
+							eorFailed = true
+						}
+					}
+					if !eorFailed {
+						batchRecords = append(batchRecords, rec)
+					}
+
+				case actionAdjRibInPeerDown:
+					// Flush pending adj_rib_in routes, then delete peer's routes.
+					if len(adjBatch) > 0 {
+						if err := p.writer.FlushAdjRibInBatch(ctx, adjBatch); err != nil {
+							p.logger.Error("pre-adj-peerdown flush failed", zap.Error(err))
+							continue
+						}
+						adjBatch = nil
+					}
+					if err := p.writer.HandleAdjRibInPeerDown(ctx, routes[0].RouterID, routes[0].PeerAddress); err != nil {
+						p.logger.Error("adj_rib_in peer down failed", zap.Error(err))
+					} else {
+						batchRecords = append(batchRecords, rec)
+					}
 				}
 			}
 
 			if len(batchRecords) >= p.batchSize {
-				if err := p.flush(ctx, batch, batchRecords, flushed); err != nil {
+				if err := p.flushAll(ctx, batch, adjBatch, batchRecords, flushed); err != nil {
 					p.logger.Error("batch flush failed", zap.Error(err))
 				} else {
 					batch = nil
+					adjBatch = nil
 					batchRecords = nil
 				}
 			}
@@ -173,19 +217,21 @@ func (p *Pipeline) Run(ctx context.Context, records <-chan []*kgo.Record, flushe
 			if len(batchRecords) >= p.batchSize*10 {
 				p.logger.Error("dropping oversized batch after repeated flush failures",
 					zap.Int("dropped_records", len(batchRecords)),
-					zap.Int("dropped_routes", len(batch)),
+					zap.Int("dropped_routes", len(batch)+len(adjBatch)),
 				)
 				metrics.BatchDroppedTotal.WithLabelValues("state").Inc()
 				batch = nil
+				adjBatch = nil
 				batchRecords = nil
 			}
 
 		case <-ticker.C:
 			if len(batchRecords) > 0 {
-				if err := p.flush(ctx, batch, batchRecords, flushed); err != nil {
+				if err := p.flushAll(ctx, batch, adjBatch, batchRecords, flushed); err != nil {
 					p.logger.Error("timer flush failed", zap.Error(err))
 				} else {
 					batch = nil
+					adjBatch = nil
 					batchRecords = nil
 				}
 			}
@@ -196,9 +242,12 @@ func (p *Pipeline) Run(ctx context.Context, records <-chan []*kgo.Record, flushe
 type recordAction int
 
 const (
-	actionRoute    recordAction = iota
+	actionRoute             recordAction = iota
 	actionEOR
 	actionPeerDown
+	actionAdjRibInRoute     // Adj-RIB-In route add/withdraw
+	actionAdjRibInEOR       // Adj-RIB-In End-of-RIB
+	actionAdjRibInPeerDown  // Non-Loc-RIB peer down
 )
 
 func (p *Pipeline) processRecord(ctx context.Context, rec *kgo.Record) ([]*ParsedRoute, recordAction) {
@@ -314,125 +363,231 @@ func (p *Pipeline) processRawRecord(ctx context.Context, rec *kgo.Record) ([]*Pa
 	finalAction := actionRoute
 
 	for _, parsed := range msgs {
-		if !parsed.IsLocRIB {
-			continue
-		}
-
-		// Extract router ID from BMP per-peer header. For Loc-RIB
-		// (RFC 9069), RouterIDFromPeerHeader reads the Peer BGP ID
-		// field since the Peer Address is zero. Fall back to the
-		// OpenBMP v1.7 header's router IP if still empty.
-		peerHdrOffset := parsed.Offset + bmp.CommonHeaderSize
-		routerID := bmp.RouterIDFromPeerHeader(bmpBytes[peerHdrOffset:])
-		if routerID == "" || routerID == "::" || routerID == "0.0.0.0" {
-			if obmpRouterIP != "" {
-				routerID = obmpRouterIP
-			}
-		}
-
-		if parsed.MsgType == bmp.MsgTypePeerUp {
-			metrics.KafkaMessagesTotal.WithLabelValues("state", rec.Topic, "", "peer_up").Inc()
-			for _, afi := range []int{4, 6} {
-				if err := p.writer.UpdateSessionStart(ctx, routerID, parsed.TableName, afi); err != nil {
-					p.logger.Error("UpdateSessionStart failed",
-						zap.String("router_id", routerID),
-						zap.String("table_name", parsed.TableName),
-						zap.Int("afi", afi),
-						zap.Error(err),
-					)
+		if parsed.IsLocRIB {
+			// --- Loc-RIB path (UNCHANGED) ---
+			peerHdrOffset := parsed.Offset + bmp.CommonHeaderSize
+			routerID := bmp.RouterIDFromPeerHeader(bmpBytes[peerHdrOffset:])
+			if routerID == "" || routerID == "::" || routerID == "0.0.0.0" {
+				if obmpRouterIP != "" {
+					routerID = obmpRouterIP
 				}
 			}
-			continue
-		}
 
-		if parsed.MsgType == bmp.MsgTypePeerDown {
-			metrics.KafkaMessagesTotal.WithLabelValues("state", rec.Topic, "", "peer_down").Inc()
-			p.logger.Info("BMP Peer Down received",
-				zap.String("router_id", routerID),
-				zap.String("table_name", parsed.TableName),
-				zap.Uint8("reason_code", parsed.PeerDownReason),
-			)
-			finalAction = actionPeerDown
-			routes = append(routes, &ParsedRoute{RouterID: routerID, TableName: parsed.TableName})
-			break
-		}
-
-		if parsed.MsgType != bmp.MsgTypeRouteMonitoring || parsed.BGPData == nil {
-			continue
-		}
-
-		// Verify this is actually a BGP UPDATE before parsing.
-		if len(parsed.BGPData) < bgp.BGPHeaderSize || parsed.BGPData[18] != bgp.BGPMsgTypeUpdate {
-			continue
-		}
-
-		// ParseUpdateAutoDetect handles routers that send Add-Path
-		// encoded NLRI without setting the F-bit (e.g. Arista cEOS).
-		events, actualAddPath, err := bgp.ParseUpdateAutoDetect(parsed.BGPData, parsed.HasAddPath)
-		if err != nil {
-			metrics.ParseErrorsTotal.WithLabelValues("raw", "bgp_parse").Inc()
-			p.logger.Warn("failed to parse BGP UPDATE",
-				zap.String("topic", rec.Topic),
-				zap.Error(err),
-			)
-			continue
-		}
-
-		if actualAddPath != parsed.HasAddPath {
-			p.logger.Warn("Add-Path auto-detected: router sends Add-Path NLRI without F-bit in BMP per-peer header (RFC 9069 non-compliance)",
-				zap.String("router_id", routerID),
-				zap.String("table_name", parsed.TableName),
-			)
-		}
-
-		// EOR: empty UPDATE means End-of-RIB.
-		if len(events) == 0 {
-			afi := bgp.DetectEORAFI(parsed.BGPData)
-			afiStr := fmt.Sprintf("%d", afi)
-			metrics.KafkaMessagesTotal.WithLabelValues("state", rec.Topic, afiStr, "eor").Inc()
-			metrics.LastMsgTimestamp.WithLabelValues("state", routerID, parsed.TableName, afiStr).SetToCurrentTime()
-			routes = append(routes, &ParsedRoute{
-				RouterID:  routerID,
-				TableName: parsed.TableName,
-				AFI:       afi,
-				IsLocRIB:  true,
-				IsEOR:     true,
-			})
-			finalAction = actionEOR
-			continue
-		}
-
-		for _, ev := range events {
-			afiStr := fmt.Sprintf("%d", ev.AFI)
-			metrics.KafkaMessagesTotal.WithLabelValues("state", rec.Topic, afiStr, ev.Action).Inc()
-			metrics.LastMsgTimestamp.WithLabelValues("state", routerID, parsed.TableName, afiStr).SetToCurrentTime()
-
-			r := &ParsedRoute{
-				RouterID:  routerID,
-				TableName: parsed.TableName,
-				AFI:       ev.AFI,
-				Prefix:    ev.Prefix,
-				PathID:    ev.PathID,
-				Action:    ev.Action,
-				IsLocRIB:  true,
-				Nexthop:   ev.Nexthop,
-				ASPath:    ev.ASPath,
-				Origin:    ev.Origin,
-				LocalPref: ev.LocalPref,
-				MED:       ev.MED,
-				OriginASN: bgp.OriginASN(ev.ASPath),
-				CommStd:   ev.CommStd,
-				CommExt:   ev.CommExt,
-				CommLarge: ev.CommLarge,
-			}
-			if len(ev.Attrs) > 0 {
-				attrs := make(map[string]any, len(ev.Attrs))
-				for k, v := range ev.Attrs {
-					attrs[k] = v
+			if parsed.MsgType == bmp.MsgTypePeerUp {
+				metrics.KafkaMessagesTotal.WithLabelValues("state", rec.Topic, "", "peer_up").Inc()
+				for _, afi := range []int{4, 6} {
+					if err := p.writer.UpdateSessionStart(ctx, routerID, parsed.TableName, afi); err != nil {
+						p.logger.Error("UpdateSessionStart failed",
+							zap.String("router_id", routerID),
+							zap.String("table_name", parsed.TableName),
+							zap.Int("afi", afi),
+							zap.Error(err),
+						)
+					}
 				}
-				r.Attrs = attrs
+				continue
 			}
-			routes = append(routes, r)
+
+			if parsed.MsgType == bmp.MsgTypePeerDown {
+				metrics.KafkaMessagesTotal.WithLabelValues("state", rec.Topic, "", "peer_down").Inc()
+				p.logger.Info("BMP Peer Down received",
+					zap.String("router_id", routerID),
+					zap.String("table_name", parsed.TableName),
+					zap.Uint8("reason_code", parsed.PeerDownReason),
+				)
+				finalAction = actionPeerDown
+				routes = append(routes, &ParsedRoute{RouterID: routerID, TableName: parsed.TableName})
+				break
+			}
+
+			if parsed.MsgType != bmp.MsgTypeRouteMonitoring || parsed.BGPData == nil {
+				continue
+			}
+
+			if len(parsed.BGPData) < bgp.BGPHeaderSize || parsed.BGPData[18] != bgp.BGPMsgTypeUpdate {
+				continue
+			}
+
+			events, actualAddPath, err := bgp.ParseUpdateAutoDetect(parsed.BGPData, parsed.HasAddPath)
+			if err != nil {
+				metrics.ParseErrorsTotal.WithLabelValues("raw", "bgp_parse").Inc()
+				p.logger.Warn("failed to parse BGP UPDATE",
+					zap.String("topic", rec.Topic),
+					zap.Error(err),
+				)
+				continue
+			}
+
+			if actualAddPath != parsed.HasAddPath {
+				p.logger.Warn("Add-Path auto-detected: router sends Add-Path NLRI without F-bit in BMP per-peer header (RFC 9069 non-compliance)",
+					zap.String("router_id", routerID),
+					zap.String("table_name", parsed.TableName),
+				)
+			}
+
+			// EOR: empty UPDATE means End-of-RIB.
+			if len(events) == 0 {
+				afi := bgp.DetectEORAFI(parsed.BGPData)
+				afiStr := fmt.Sprintf("%d", afi)
+				metrics.KafkaMessagesTotal.WithLabelValues("state", rec.Topic, afiStr, "eor").Inc()
+				metrics.LastMsgTimestamp.WithLabelValues("state", routerID, parsed.TableName, afiStr).SetToCurrentTime()
+				routes = append(routes, &ParsedRoute{
+					RouterID:  routerID,
+					TableName: parsed.TableName,
+					AFI:       afi,
+					IsLocRIB:  true,
+					IsEOR:     true,
+				})
+				finalAction = actionEOR
+				continue
+			}
+
+			for _, ev := range events {
+				afiStr := fmt.Sprintf("%d", ev.AFI)
+				metrics.KafkaMessagesTotal.WithLabelValues("state", rec.Topic, afiStr, ev.Action).Inc()
+				metrics.LastMsgTimestamp.WithLabelValues("state", routerID, parsed.TableName, afiStr).SetToCurrentTime()
+
+				r := &ParsedRoute{
+					RouterID:  routerID,
+					TableName: parsed.TableName,
+					AFI:       ev.AFI,
+					Prefix:    ev.Prefix,
+					PathID:    ev.PathID,
+					Action:    ev.Action,
+					IsLocRIB:  true,
+					Nexthop:   ev.Nexthop,
+					ASPath:    ev.ASPath,
+					Origin:    ev.Origin,
+					LocalPref: ev.LocalPref,
+					MED:       ev.MED,
+					OriginASN: bgp.OriginASN(ev.ASPath),
+					CommStd:   ev.CommStd,
+					CommExt:   ev.CommExt,
+					CommLarge: ev.CommLarge,
+				}
+				if len(ev.Attrs) > 0 {
+					attrs := make(map[string]any, len(ev.Attrs))
+					for k, v := range ev.Attrs {
+						attrs[k] = v
+					}
+					r.Attrs = attrs
+				}
+				routes = append(routes, r)
+			}
+		} else {
+			// --- Adj-RIB-In path (peer types 0/1/2) ---
+			// For non-Loc-RIB, router ID comes from OBMP header (the BMP speaker),
+			// NOT from per-peer header offset 30 (which is the peer's BGP ID).
+			routerID := obmpRouterIP
+
+			switch parsed.MsgType {
+			case bmp.MsgTypePeerUp:
+				// Non-Loc-RIB Peer Up: record session start for stale route tracking.
+				metrics.KafkaMessagesTotal.WithLabelValues("state", rec.Topic, "", "adj_peer_up").Inc()
+				if p.writer != nil {
+					for _, afi := range []int{4, 6} {
+						if err := p.writer.UpdateAdjRibInSessionStart(ctx, routerID, parsed.PeerAddress, afi); err != nil {
+							p.logger.Error("UpdateAdjRibInSessionStart failed",
+								zap.String("router_id", routerID),
+								zap.String("peer_address", parsed.PeerAddress),
+								zap.Int("afi", afi),
+								zap.Error(err),
+							)
+						}
+					}
+				}
+				continue
+
+			case bmp.MsgTypePeerDown:
+				// Non-Loc-RIB Peer Down: delete all adj_rib_in for this peer.
+				metrics.KafkaMessagesTotal.WithLabelValues("state", rec.Topic, "", "adj_peer_down").Inc()
+				p.logger.Info("Adj-RIB-In Peer Down received",
+					zap.String("router_id", routerID),
+					zap.String("peer_address", parsed.PeerAddress),
+					zap.Uint8("reason_code", parsed.PeerDownReason),
+				)
+				finalAction = actionAdjRibInPeerDown
+				routes = append(routes, &ParsedRoute{
+					RouterID:     routerID,
+					PeerAddress:  parsed.PeerAddress,
+					PeerAS:       parsed.PeerAS,
+					PeerBGPID:    parsed.PeerBGPID,
+					IsPostPolicy: parsed.IsPostPolicy,
+				})
+				continue
+
+			case bmp.MsgTypeRouteMonitoring:
+				if parsed.BGPData == nil {
+					continue
+				}
+				if len(parsed.BGPData) < bgp.BGPHeaderSize || parsed.BGPData[18] != bgp.BGPMsgTypeUpdate {
+					continue
+				}
+
+				events, _, err := bgp.ParseUpdateAutoDetect(parsed.BGPData, parsed.HasAddPath)
+				if err != nil {
+					metrics.ParseErrorsTotal.WithLabelValues("raw", "bgp_parse_adj").Inc()
+					continue
+				}
+
+				// EOR for Adj-RIB-In
+				if len(events) == 0 {
+					afi := bgp.DetectEORAFI(parsed.BGPData)
+					afiStr := fmt.Sprintf("%d", afi)
+					metrics.KafkaMessagesTotal.WithLabelValues("state", rec.Topic, afiStr, "adj_eor").Inc()
+
+					tableName := parsed.TableName
+					if tableName == "UNKNOWN" {
+						tableName = ""
+					}
+
+					routes = append(routes, &ParsedRoute{
+						RouterID:     routerID,
+						PeerAddress:  parsed.PeerAddress,
+						PeerAS:       parsed.PeerAS,
+						PeerBGPID:    parsed.PeerBGPID,
+						IsPostPolicy: parsed.IsPostPolicy,
+						TableName:    tableName,
+						AFI:          afi,
+						IsEOR:        true,
+					})
+					finalAction = actionAdjRibInEOR
+					continue
+				}
+
+				tableName := parsed.TableName
+				if tableName == "UNKNOWN" {
+					tableName = ""
+				}
+
+				for _, ev := range events {
+					afiStr := fmt.Sprintf("%d", ev.AFI)
+					metrics.KafkaMessagesTotal.WithLabelValues("state", rec.Topic, afiStr, "adj_"+ev.Action).Inc()
+
+					routes = append(routes, &ParsedRoute{
+						RouterID:     routerID,
+						PeerAddress:  parsed.PeerAddress,
+						PeerAS:       parsed.PeerAS,
+						PeerBGPID:    parsed.PeerBGPID,
+						IsPostPolicy: parsed.IsPostPolicy,
+						TableName:    tableName,
+						AFI:          ev.AFI,
+						Prefix:       ev.Prefix,
+						PathID:       ev.PathID,
+						Action:       ev.Action,
+						Nexthop:      ev.Nexthop,
+						ASPath:       ev.ASPath,
+						Origin:       ev.Origin,
+						LocalPref:    ev.LocalPref,
+						MED:          ev.MED,
+						OriginASN:    bgp.OriginASN(ev.ASPath),
+						CommStd:      ev.CommStd,
+						CommExt:      ev.CommExt,
+						CommLarge:    ev.CommLarge,
+					})
+				}
+				finalAction = actionAdjRibInRoute
+			}
 		}
 	}
 
@@ -443,8 +598,11 @@ func (p *Pipeline) processRawRecord(ctx context.Context, rec *kgo.Record) ([]*Pa
 	return routes, finalAction
 }
 
-func (p *Pipeline) flush(ctx context.Context, batch []*ParsedRoute, records []*kgo.Record, flushed chan<- []*kgo.Record) error {
+func (p *Pipeline) flushAll(ctx context.Context, batch, adjBatch []*ParsedRoute, records []*kgo.Record, flushed chan<- []*kgo.Record) error {
 	if err := p.writer.FlushBatch(ctx, batch); err != nil {
+		return err
+	}
+	if err := p.writer.FlushAdjRibInBatch(ctx, adjBatch); err != nil {
 		return err
 	}
 

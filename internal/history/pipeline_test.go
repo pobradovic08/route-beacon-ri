@@ -270,24 +270,38 @@ func TestHistoryProcessRecord_BasicRoute(t *testing.T) {
 	}
 }
 
-func TestHistoryProcessRecord_SkipNonLocRIB(t *testing.T) {
+func TestHistoryProcessRecord_NonLocRIBPeerFields(t *testing.T) {
 	p := newTestHistoryPipeline()
 
-	// Build with peer_type=0 (Global). Should be filtered out.
+	// Build with peer_type=0 (Global). Non-Loc-RIB is now processed for history.
 	nlri := []byte{24, 10, 0, 0}
 	originAttr := buildPathAttr(0x40, bgp.AttrTypeOrigin, []byte{0})
 	nexthopAttr := buildPathAttr(0x40, bgp.AttrTypeNextHop, []byte{192, 168, 1, 1})
 	pathAttrs := append(originAttr, nexthopAttr...)
 	bgpUpdate := buildBGPUpdate(nil, pathAttrs, nlri)
 
-	bmpMsg := buildBMPRouteMonitoring(bmp.PeerTypeGlobal, 0, [4]byte{10, 0, 0, 1}, bgpUpdate, "global")
+	// Non-Loc-RIB Route Monitoring has no TLVs (RFC 7854), so pass empty table name.
+	bmpMsg := buildBMPRouteMonitoring(bmp.PeerTypeGlobal, 0, [4]byte{10, 0, 0, 1}, bgpUpdate, "")
 	frame := wrapOpenBMP(bmpMsg)
 
 	rec := &kgo.Record{Value: frame, Topic: "gobmp.raw"}
 	rows := p.processRecord(context.Background(), rec)
 
-	if len(rows) != 0 {
-		t.Errorf("expected 0 rows for non-Loc-RIB peer, got %d", len(rows))
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row for non-Loc-RIB peer, got %d", len(rows))
+	}
+	row := rows[0]
+	if row.IsLocRIB {
+		t.Error("expected IsLocRIB=false for Global peer")
+	}
+	if row.PeerAddress != "10.0.0.1" {
+		t.Errorf("expected PeerAddress '10.0.0.1', got '%s'", row.PeerAddress)
+	}
+	if row.Event.Prefix != "10.0.0.0/24" {
+		t.Errorf("expected prefix '10.0.0.0/24', got '%s'", row.Event.Prefix)
+	}
+	if row.Event.Action != "A" {
+		t.Errorf("expected action 'A', got '%s'", row.Event.Action)
 	}
 }
 

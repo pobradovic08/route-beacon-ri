@@ -42,11 +42,15 @@ func (pm *PartitionManager) Run(ctx context.Context) error {
 	return nil
 }
 
-// RefreshSummary refreshes the route_summary materialized view concurrently.
+// RefreshSummary refreshes the route_summary and adj_rib_in_summary materialized views concurrently.
 func (pm *PartitionManager) RefreshSummary(ctx context.Context) error {
 	_, err := pm.pool.Exec(ctx, "REFRESH MATERIALIZED VIEW CONCURRENTLY route_summary")
 	if err != nil {
 		pm.logger.Warn("failed to refresh route_summary (may not exist yet)", zap.Error(err))
+	}
+	_, err = pm.pool.Exec(ctx, "REFRESH MATERIALIZED VIEW CONCURRENTLY adj_rib_in_summary")
+	if err != nil {
+		pm.logger.Warn("failed to refresh adj_rib_in_summary (may not exist yet)", zap.Error(err))
 	}
 	return nil
 }

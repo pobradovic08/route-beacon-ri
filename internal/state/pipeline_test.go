@@ -455,11 +455,14 @@ func TestProcessRawRecord_NonLocRIBPeerDown(t *testing.T) {
 	rec := &kgo.Record{Value: frame, Topic: "gobmp.raw"}
 	routes, action := p.processRawRecord(context.Background(), rec)
 
-	if action != actionRoute {
-		t.Fatalf("expected actionRoute (skipped), got %d", action)
+	if action != actionAdjRibInPeerDown {
+		t.Fatalf("expected actionAdjRibInPeerDown, got %d", action)
 	}
-	if routes != nil {
-		t.Errorf("expected nil routes for non-Loc-RIB peer down, got %d", len(routes))
+	if len(routes) != 1 {
+		t.Fatalf("expected 1 route for non-Loc-RIB peer down, got %d", len(routes))
+	}
+	if routes[0].PeerAddress != "10.0.0.1" {
+		t.Errorf("expected PeerAddress '10.0.0.1', got '%s'", routes[0].PeerAddress)
 	}
 }
 
@@ -510,7 +513,7 @@ func TestProcessRawRecord_NonUpdateNotEOR(t *testing.T) {
 
 // --- T011: Filtering and edge case tests ---
 
-func TestProcessRawRecord_GlobalPeerFiltered(t *testing.T) {
+func TestProcessRawRecord_GlobalPeerAdjRibIn(t *testing.T) {
 	p := newTestPipeline(true)
 
 	nlri := []byte{24, 10, 0, 0}
@@ -519,17 +522,31 @@ func TestProcessRawRecord_GlobalPeerFiltered(t *testing.T) {
 	pathAttrs := append(originAttr, nexthopAttr...)
 	bgpUpdate := buildBGPUpdate(nil, pathAttrs, nlri)
 
-	bmpMsg := buildBMPRouteMonitoring(bmp.PeerTypeGlobal, 0, [4]byte{10, 0, 0, 1}, bgpUpdate, "global")
+	// Non-Loc-RIB Route Monitoring has no TLVs (RFC 7854), so pass empty table name.
+	bmpMsg := buildBMPRouteMonitoring(bmp.PeerTypeGlobal, 0, [4]byte{10, 0, 0, 1}, bgpUpdate, "")
 	frame := wrapOpenBMP(bmpMsg)
 
 	rec := &kgo.Record{Value: frame, Topic: "gobmp.raw"}
-	routes, _ := p.processRawRecord(context.Background(), rec)
-	if routes != nil {
-		t.Errorf("expected nil routes for Global peer, got %d", len(routes))
+	routes, action := p.processRawRecord(context.Background(), rec)
+
+	if action != actionAdjRibInRoute {
+		t.Fatalf("expected actionAdjRibInRoute, got %d", action)
+	}
+	if len(routes) != 1 {
+		t.Fatalf("expected 1 route for Global peer Adj-RIB-In, got %d", len(routes))
+	}
+	if routes[0].PeerAddress != "10.0.0.1" {
+		t.Errorf("expected PeerAddress '10.0.0.1', got '%s'", routes[0].PeerAddress)
+	}
+	if routes[0].Prefix != "10.0.0.0/24" {
+		t.Errorf("expected prefix '10.0.0.0/24', got '%s'", routes[0].Prefix)
+	}
+	if routes[0].IsPostPolicy {
+		t.Error("expected IsPostPolicy=false for pre-policy peer")
 	}
 }
 
-func TestProcessRawRecord_RDPeerFiltered(t *testing.T) {
+func TestProcessRawRecord_RDPeerAdjRibIn(t *testing.T) {
 	p := newTestPipeline(true)
 
 	nlri := []byte{24, 10, 0, 0}
@@ -538,17 +555,27 @@ func TestProcessRawRecord_RDPeerFiltered(t *testing.T) {
 	pathAttrs := append(originAttr, nexthopAttr...)
 	bgpUpdate := buildBGPUpdate(nil, pathAttrs, nlri)
 
-	bmpMsg := buildBMPRouteMonitoring(bmp.PeerTypeRD, 0, [4]byte{10, 0, 0, 1}, bgpUpdate, "rd")
+	bmpMsg := buildBMPRouteMonitoring(bmp.PeerTypeRD, 0, [4]byte{10, 0, 0, 1}, bgpUpdate, "")
 	frame := wrapOpenBMP(bmpMsg)
 
 	rec := &kgo.Record{Value: frame, Topic: "gobmp.raw"}
-	routes, _ := p.processRawRecord(context.Background(), rec)
-	if routes != nil {
-		t.Errorf("expected nil routes for RD peer, got %d", len(routes))
+	routes, action := p.processRawRecord(context.Background(), rec)
+
+	if action != actionAdjRibInRoute {
+		t.Fatalf("expected actionAdjRibInRoute, got %d", action)
+	}
+	if len(routes) != 1 {
+		t.Fatalf("expected 1 route for RD peer Adj-RIB-In, got %d", len(routes))
+	}
+	if routes[0].PeerAddress != "10.0.0.1" {
+		t.Errorf("expected PeerAddress '10.0.0.1', got '%s'", routes[0].PeerAddress)
+	}
+	if routes[0].Prefix != "10.0.0.0/24" {
+		t.Errorf("expected prefix '10.0.0.0/24', got '%s'", routes[0].Prefix)
 	}
 }
 
-func TestProcessRawRecord_LocalPeerFiltered(t *testing.T) {
+func TestProcessRawRecord_LocalPeerAdjRibIn(t *testing.T) {
 	p := newTestPipeline(true)
 
 	nlri := []byte{24, 10, 0, 0}
@@ -557,13 +584,23 @@ func TestProcessRawRecord_LocalPeerFiltered(t *testing.T) {
 	pathAttrs := append(originAttr, nexthopAttr...)
 	bgpUpdate := buildBGPUpdate(nil, pathAttrs, nlri)
 
-	bmpMsg := buildBMPRouteMonitoring(bmp.PeerTypeLocal, 0, [4]byte{10, 0, 0, 1}, bgpUpdate, "local")
+	bmpMsg := buildBMPRouteMonitoring(bmp.PeerTypeLocal, 0, [4]byte{10, 0, 0, 1}, bgpUpdate, "")
 	frame := wrapOpenBMP(bmpMsg)
 
 	rec := &kgo.Record{Value: frame, Topic: "gobmp.raw"}
-	routes, _ := p.processRawRecord(context.Background(), rec)
-	if routes != nil {
-		t.Errorf("expected nil routes for Local peer, got %d", len(routes))
+	routes, action := p.processRawRecord(context.Background(), rec)
+
+	if action != actionAdjRibInRoute {
+		t.Fatalf("expected actionAdjRibInRoute, got %d", action)
+	}
+	if len(routes) != 1 {
+		t.Fatalf("expected 1 route for Local peer Adj-RIB-In, got %d", len(routes))
+	}
+	if routes[0].PeerAddress != "10.0.0.1" {
+		t.Errorf("expected PeerAddress '10.0.0.1', got '%s'", routes[0].PeerAddress)
+	}
+	if routes[0].Prefix != "10.0.0.0/24" {
+		t.Errorf("expected prefix '10.0.0.0/24', got '%s'", routes[0].Prefix)
 	}
 }
 

@@ -41,6 +41,10 @@ const BMPVersion uint8 = 3
 // this bit despite sending Add-Path encoded NLRI.
 const PeerFlagAddPath uint8 = 0x80
 
+// PeerFlagPostPolicy is the L-bit (bit 6, 0x40) of BMP peer flags.
+// L=0 means pre-policy Adj-RIB-In, L=1 means post-policy.
+const PeerFlagPostPolicy uint8 = 0x40
+
 // ParsedBMP represents a parsed BMP message.
 type ParsedBMP struct {
 	MsgType        uint8
@@ -56,4 +60,8 @@ type ParsedBMP struct {
 	PeerDownReason uint8  // Reason code from Peer Down (offset 42)
 	LocalASN       uint32 // Router's own ASN from Sent OPEN in non-Loc-RIB Peer Up
 	LocalBGPID     string // Router's own BGP Identifier from Sent OPEN in non-Loc-RIB Peer Up
+	PeerAddress    string // Peer's IP address from per-peer header (non-Loc-RIB only)
+	PeerAS         uint32 // Peer's ASN from per-peer header (non-Loc-RIB only)
+	PeerBGPID      string // Peer's BGP Identifier from per-peer header (non-Loc-RIB only)
+	IsPostPolicy   bool   // L-flag: false=pre-policy (L=0), true=post-policy (L=1)
 }
