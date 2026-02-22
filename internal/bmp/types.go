@@ -54,4 +54,6 @@ type ParsedBMP struct {
 	SysName        string // From Initiation TLV type 2
 	SysDescr       string // From Initiation TLV type 1
 	PeerDownReason uint8  // Reason code from Peer Down (offset 42)
+	LocalASN       uint32 // Router's own ASN from Sent OPEN in non-Loc-RIB Peer Up
+	LocalBGPID     string // Router's own BGP Identifier from Sent OPEN in non-Loc-RIB Peer Up
 }

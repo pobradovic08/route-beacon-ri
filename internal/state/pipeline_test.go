@@ -137,7 +137,7 @@ func wrapOpenBMP(bmpMsg []byte) []byte {
 }
 
 func newTestPipeline(rawMode bool) *Pipeline {
-	return NewPipeline(nil, 1000, 200, rawMode, 16*1024*1024, zap.NewNop())
+	return NewPipeline(nil, 1000, 200, rawMode, 16*1024*1024, zap.NewNop(), nil)
 }
 
 // --- T008: Raw mode route processing tests ---
@@ -662,7 +662,7 @@ func TestProcessRawRecord_MalformedBMP(t *testing.T) {
 }
 
 func TestProcessRawRecord_OversizedPayload(t *testing.T) {
-	p := NewPipeline(nil, 1000, 200, true, 100, zap.NewNop()) // maxPayloadBytes=100
+	p := NewPipeline(nil, 1000, 200, true, 100, zap.NewNop(), nil) // maxPayloadBytes=100
 
 	// Build a BMP message larger than 100 bytes.
 	bigBGP := make([]byte, 200)

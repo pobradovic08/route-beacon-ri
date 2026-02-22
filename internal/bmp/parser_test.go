@@ -835,3 +835,262 @@ func TestParsePeerDown_NoReasonByte(t *testing.T) {
 		t.Errorf("expected PeerDownReason=0 (no reason byte), got %d", parsed.PeerDownReason)
 	}
 }
+
+// --- Peer Up ASN extraction tests ---
+
+// buildBGPOPEN constructs a valid BGP OPEN message with configurable ASN.
+// If use4ByteASN is true, the 2-byte ASN field is set to AS_TRANS (23456) and
+// a 4-byte ASN capability (code 65) is added with the real ASN value.
+func buildBGPOPEN(asn uint32, use4ByteASN bool) []byte {
+	// BGP OPEN: marker(16) + length(2) + type(1) + version(1) + my_as(2) +
+	//           hold_time(2) + bgp_id(4) + opt_parm_len(1) + [opt params]
+	var optParams []byte
+	if use4ByteASN {
+		// Capability 65 (4-byte ASN): param_type(1)=2 + param_len(1)=6 +
+		// cap_code(1)=65 + cap_len(1)=4 + as4(4)
+		optParams = make([]byte, 8)
+		optParams[0] = 2 // parameter type = Capabilities
+		optParams[1] = 6 // parameter length
+		optParams[2] = 65 // capability code = 4-byte ASN
+		optParams[3] = 4  // capability length
+		binary.BigEndian.PutUint32(optParams[4:8], asn)
+	}
+
+	totalLen := 29 + len(optParams)
+	msg := make([]byte, totalLen)
+
+	// Marker: 16 bytes of 0xFF
+	for i := 0; i < 16; i++ {
+		msg[i] = 0xFF
+	}
+	binary.BigEndian.PutUint16(msg[16:18], uint16(totalLen)) // length
+	msg[18] = 1 // type = OPEN
+	msg[19] = 4 // version = 4
+
+	if use4ByteASN {
+		binary.BigEndian.PutUint16(msg[20:22], 23456) // AS_TRANS
+	} else {
+		binary.BigEndian.PutUint16(msg[20:22], uint16(asn))
+	}
+
+	binary.BigEndian.PutUint16(msg[22:24], 180) // hold time
+	// BGP ID = 10.0.0.1
+	msg[24] = 10
+	msg[25] = 0
+	msg[26] = 0
+	msg[27] = 1
+	msg[28] = uint8(len(optParams)) // opt parm len
+
+	copy(msg[29:], optParams)
+	return msg
+}
+
+// buildBMPPeerUp constructs a valid BMP Peer Up message with configurable
+// peer type, ASN, and 4-byte ASN capability. For non-Loc-RIB, includes
+// Local Address, Ports, and a Sent OPEN with the specified ASN.
+func buildBMPPeerUp(peerType uint8, localASN uint32, use4ByteASN bool) []byte {
+	if peerType == PeerTypeLocRIB {
+		// Loc-RIB Peer Up: common header + per-peer header only
+		totalLen := CommonHeaderSize + PerPeerHeaderSize
+		msg := make([]byte, totalLen)
+		msg[0] = BMPVersion
+		binary.BigEndian.PutUint32(msg[1:5], uint32(totalLen))
+		msg[5] = MsgTypePeerUp
+		msg[CommonHeaderSize] = peerType
+		return msg
+	}
+
+	// Non-Loc-RIB: Per-Peer Header (42) + Local Address (16) + Local Port (2) +
+	// Remote Port (2) + Sent OPEN + Received OPEN
+	sentOpen := buildBGPOPEN(localASN, use4ByteASN)
+	receivedOpen := buildBGPOPEN(65002, false) // dummy received OPEN
+
+	bodyLen := PerPeerHeaderSize + 16 + 2 + 2 + len(sentOpen) + len(receivedOpen)
+	totalLen := CommonHeaderSize + bodyLen
+	msg := make([]byte, totalLen)
+
+	msg[0] = BMPVersion
+	binary.BigEndian.PutUint32(msg[1:5], uint32(totalLen))
+	msg[5] = MsgTypePeerUp
+	msg[CommonHeaderSize] = peerType // peer_type
+
+	// Local Address at per-peer header + 42 = offset 48: 16 bytes (zeroed)
+	// Local Port at offset 64: 2 bytes
+	offset := CommonHeaderSize + PerPeerHeaderSize + 16
+	binary.BigEndian.PutUint16(msg[offset:offset+2], 179)   // local port
+	binary.BigEndian.PutUint16(msg[offset+2:offset+4], 179) // remote port
+
+	// Sent OPEN at offset 68
+	sentOpenOffset := offset + 4
+	copy(msg[sentOpenOffset:], sentOpen)
+
+	// Received OPEN follows
+	copy(msg[sentOpenOffset+len(sentOpen):], receivedOpen)
+
+	return msg
+}
+
+func TestParsePeerUp_NonLocRIB_2ByteASN(t *testing.T) {
+	msg := buildBMPPeerUp(PeerTypeGlobal, 65001, false)
+
+	parsed, err := Parse(msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if parsed.LocalASN != 65001 {
+		t.Errorf("expected LocalASN=65001, got %d", parsed.LocalASN)
+	}
+	if parsed.IsLocRIB {
+		t.Error("expected IsLocRIB=false")
+	}
+	if parsed.MsgType != MsgTypePeerUp {
+		t.Errorf("expected MsgType=%d, got %d", MsgTypePeerUp, parsed.MsgType)
+	}
+}
+
+func TestParsePeerUp_NonLocRIB_4ByteASN(t *testing.T) {
+	msg := buildBMPPeerUp(PeerTypeGlobal, 400000, true)
+
+	parsed, err := Parse(msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if parsed.LocalASN != 400000 {
+		t.Errorf("expected LocalASN=400000, got %d", parsed.LocalASN)
+	}
+}
+
+func TestParsePeerUp_NonLocRIB_PreservesFields(t *testing.T) {
+	msg := buildBMPPeerUp(PeerTypeGlobal, 65001, false)
+	// Set Add-Path flag
+	msg[CommonHeaderSize+1] = PeerFlagAddPath
+
+	parsed, err := Parse(msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if parsed.PeerType != PeerTypeGlobal {
+		t.Errorf("expected PeerType=%d, got %d", PeerTypeGlobal, parsed.PeerType)
+	}
+	if !parsed.HasAddPath {
+		t.Error("expected HasAddPath=true")
+	}
+	if parsed.LocalASN != 65001 {
+		t.Errorf("expected LocalASN=65001, got %d", parsed.LocalASN)
+	}
+}
+
+func TestParsePeerUp_LocRIB_NoASN(t *testing.T) {
+	msg := buildBMPPeerUp(PeerTypeLocRIB, 0, false)
+
+	parsed, err := Parse(msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if parsed.LocalASN != 0 {
+		t.Errorf("expected LocalASN=0 for Loc-RIB, got %d", parsed.LocalASN)
+	}
+	if !parsed.IsLocRIB {
+		t.Error("expected IsLocRIB=true")
+	}
+}
+
+// --- US3: Edge case tests ---
+
+func TestParsePeerUp_NonLocRIB_TruncatedSentOpen(t *testing.T) {
+	// Build a non-Loc-RIB Peer Up but truncate the Sent OPEN.
+	// Per-Peer Header (42) + Local Address (16) + Ports (4) = 62 bytes,
+	// then only 10 bytes of BGP OPEN (needs 29 minimum).
+	bodyLen := PerPeerHeaderSize + 16 + 2 + 2 + 10
+	totalLen := CommonHeaderSize + bodyLen
+	msg := make([]byte, totalLen)
+	msg[0] = BMPVersion
+	binary.BigEndian.PutUint32(msg[1:5], uint32(totalLen))
+	msg[5] = MsgTypePeerUp
+	msg[CommonHeaderSize] = PeerTypeGlobal
+
+	parsed, err := Parse(msg)
+	if err != nil {
+		t.Fatalf("unexpected error (should not panic): %v", err)
+	}
+	if parsed.LocalASN != 0 {
+		t.Errorf("expected LocalASN=0 for truncated Sent OPEN, got %d", parsed.LocalASN)
+	}
+}
+
+func TestParsePeerUp_NonLocRIB_MalformedMarker(t *testing.T) {
+	// Build a non-Loc-RIB Peer Up with a malformed BGP marker in Sent OPEN.
+	msg := buildBMPPeerUp(PeerTypeGlobal, 65001, false)
+
+	// Corrupt the BGP marker in the Sent OPEN (at offset 68 = CommonHeader+PerPeer+LocalAddr+Ports).
+	sentOpenOffset := CommonHeaderSize + PerPeerHeaderSize + 16 + 2 + 2
+	msg[sentOpenOffset+5] = 0x00 // corrupt marker byte
+
+	parsed, err := Parse(msg)
+	if err != nil {
+		t.Fatalf("unexpected error (should not panic): %v", err)
+	}
+	if parsed.LocalASN != 0 {
+		t.Errorf("expected LocalASN=0 for malformed BGP marker, got %d", parsed.LocalASN)
+	}
+}
+
+func TestParsePeerUp_NonLocRIB_LocalBGPID(t *testing.T) {
+	// The Sent OPEN in buildBGPOPEN sets BGP ID = 10.0.0.1.
+	msg := buildBMPPeerUp(PeerTypeGlobal, 65001, false)
+
+	parsed, err := Parse(msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if parsed.LocalBGPID != "10.0.0.1" {
+		t.Errorf("expected LocalBGPID='10.0.0.1', got '%s'", parsed.LocalBGPID)
+	}
+}
+
+func TestParsePeerUp_LocRIB_BGPID(t *testing.T) {
+	// Loc-RIB Peer Up with Peer BGP ID set to 10.0.0.2 at per-peer header offset 30.
+	msg := buildBMPPeerUp(PeerTypeLocRIB, 0, false)
+	// BGP ID is at common header (6) + per-peer header offset 30 = 36
+	msg[36] = 10
+	msg[37] = 0
+	msg[38] = 0
+	msg[39] = 2
+
+	parsed, err := Parse(msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if parsed.LocalBGPID != "10.0.0.2" {
+		t.Errorf("expected LocalBGPID='10.0.0.2', got '%s'", parsed.LocalBGPID)
+	}
+}
+
+func TestParsePeerUp_LocRIB_NoBGPID(t *testing.T) {
+	// Loc-RIB Peer Up with all-zero per-peer header — empty BGP ID.
+	msg := buildBMPPeerUp(PeerTypeLocRIB, 0, false)
+
+	parsed, err := Parse(msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if parsed.LocalBGPID != "" {
+		t.Errorf("expected empty LocalBGPID for Loc-RIB with zero BGP ID, got '%s'", parsed.LocalBGPID)
+	}
+}
+
+func TestParsePeerUp_NonLocRIB_WrongBGPType(t *testing.T) {
+	// Build a non-Loc-RIB Peer Up where the Sent OPEN has BGP type != 1.
+	msg := buildBMPPeerUp(PeerTypeGlobal, 65001, false)
+
+	sentOpenOffset := CommonHeaderSize + PerPeerHeaderSize + 16 + 2 + 2
+	msg[sentOpenOffset+18] = 2 // type = UPDATE instead of OPEN
+
+	parsed, err := Parse(msg)
+	if err != nil {
+		t.Fatalf("unexpected error (should not panic): %v", err)
+	}
+	if parsed.LocalASN != 0 {
+		t.Errorf("expected LocalASN=0 for wrong BGP type, got %d", parsed.LocalASN)
+	}
+}

@@ -17,11 +17,17 @@ import (
 )
 
 type Config struct {
-	Service   ServiceConfig   `koanf:"service"`
-	Kafka     KafkaConfig     `koanf:"kafka"`
-	Postgres  PostgresConfig  `koanf:"postgres"`
-	Ingest    IngestConfig    `koanf:"ingest"`
-	Retention RetentionConfig `koanf:"retention"`
+	Service   ServiceConfig          `koanf:"service"`
+	Kafka     KafkaConfig            `koanf:"kafka"`
+	Postgres  PostgresConfig         `koanf:"postgres"`
+	Ingest    IngestConfig           `koanf:"ingest"`
+	Retention RetentionConfig        `koanf:"retention"`
+	Routers   map[string]RouterMeta  `koanf:"routers"`
+}
+
+type RouterMeta struct {
+	Name     string `koanf:"name"`
+	Location string `koanf:"location"`
 }
 
 type ServiceConfig struct {

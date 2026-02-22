@@ -72,17 +72,21 @@ func (w *Writer) FlushBatch(ctx context.Context, routes []*ParsedRoute) error {
 	return nil
 }
 
-// UpsertRouter inserts or updates router metadata from BMP Initiation messages.
-func (w *Writer) UpsertRouter(ctx context.Context, routerID, routerIP, hostname, description string) error {
+// UpsertRouter inserts or updates router metadata from BMP Peer Up messages
+// and operator-provided config (display_name, location).
+func (w *Writer) UpsertRouter(ctx context.Context, routerID, routerIP, hostname, description, displayName, location string) error {
 	_, err := w.pool.Exec(ctx, `
-		INSERT INTO routers (router_id, router_ip, hostname, description, first_seen, last_seen)
-		VALUES ($1, $2, $3, $4, now(), now())
+		INSERT INTO routers (router_id, router_ip, hostname, description, display_name, location, first_seen, last_seen)
+		VALUES ($1, $2, $3, $4, $5, $6, now(), now())
 		ON CONFLICT (router_id) DO UPDATE SET
-			router_ip = COALESCE(EXCLUDED.router_ip, routers.router_ip),
-			hostname = COALESCE(EXCLUDED.hostname, routers.hostname),
-			description = COALESCE(EXCLUDED.description, routers.description),
-			last_seen = now()`,
+			router_ip    = COALESCE(EXCLUDED.router_ip, routers.router_ip),
+			hostname     = COALESCE(EXCLUDED.hostname, routers.hostname),
+			description  = COALESCE(EXCLUDED.description, routers.description),
+			display_name = COALESCE(EXCLUDED.display_name, routers.display_name),
+			location     = COALESCE(EXCLUDED.location, routers.location),
+			last_seen    = now()`,
 		routerID, nullableString(routerIP), nullableString(hostname), nullableString(description),
+		nullableString(displayName), nullableString(location),
 	)
 	return err
 }

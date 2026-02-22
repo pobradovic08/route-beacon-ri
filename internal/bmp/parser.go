@@ -182,7 +182,17 @@ func parsePeerUp(data []byte, result *ParsedBMP) (*ParsedBMP, error) {
 		// RFC 9069 Section 4.4: For Loc-RIB Peer Up, the Sent Open and
 		// Received Open fields are empty (zero-length), so TLVs start
 		// right after the per-peer header.
+		result.LocalBGPID = RouterIDFromPeerHeader(data)
 		parseTLVs(data[PerPeerHeaderSize:], result)
+	} else {
+		// Non-Loc-RIB Peer Up (RFC 7854 §4.10):
+		//   Per-Peer Header (42) + Local Address (16) + Local Port (2) +
+		//   Remote Port (2) = 62 bytes before the Sent OPEN message.
+		const sentOpenOffset = PerPeerHeaderSize + 16 + 2 + 2 // 62
+		if len(data) >= sentOpenOffset+29 {
+			result.LocalASN = extractASNFromBGPOPEN(data[sentOpenOffset:])
+			result.LocalBGPID = extractBGPIDFromBGPOPEN(data[sentOpenOffset:])
+		}
 	}
 	return result, nil
 }
@@ -235,6 +245,123 @@ func parseTLVs(data []byte, result *ParsedBMP) {
 
 		offset += tlvLen
 	}
+}
+
+// extractASNFromBGPOPEN parses a BGP OPEN message and returns the router's ASN.
+// Input: raw BGP OPEN bytes starting at the 16-byte marker.
+// Returns 0 if the data is malformed or too short.
+//
+// BGP OPEN layout (RFC 4271 §4.2):
+//
+//	Offset  0: Marker (16 bytes, all 0xFF)
+//	Offset 16: Length (2 bytes)
+//	Offset 18: Type (1 byte, must be 1 for OPEN)
+//	Offset 19: Version (1 byte)
+//	Offset 20: My Autonomous System (2 bytes)
+//	Offset 22: Hold Time (2 bytes)
+//	Offset 24: BGP Identifier (4 bytes)
+//	Offset 28: Opt Parm Len (1 byte)
+//	Offset 29: Optional Parameters (variable)
+func extractASNFromBGPOPEN(data []byte) uint32 {
+	// Need at least 29 bytes: marker(16) + length(2) + type(1) + version(1) +
+	// my_as(2) + hold_time(2) + bgp_id(4) + opt_parm_len(1)
+	if len(data) < 29 {
+		return 0
+	}
+	// Validate BGP marker (16 bytes of 0xFF).
+	for i := 0; i < 16; i++ {
+		if data[i] != 0xFF {
+			return 0
+		}
+	}
+	// Type must be 1 (OPEN).
+	if data[18] != 1 {
+		return 0
+	}
+
+	msgLen := int(binary.BigEndian.Uint16(data[16:18]))
+	if msgLen < 29 || msgLen > len(data) {
+		return 0
+	}
+
+	asn := uint32(binary.BigEndian.Uint16(data[20:22]))
+
+	// If 2-byte ASN is AS_TRANS (23456), look for 4-byte ASN capability.
+	if asn == 23456 {
+		optParmLen := int(data[28])
+		if optParmLen > 0 && 29+optParmLen <= msgLen {
+			if as4 := find4ByteASNCapability(data[29 : 29+optParmLen]); as4 != 0 {
+				return as4
+			}
+		}
+	}
+
+	return asn
+}
+
+// extractBGPIDFromBGPOPEN parses a BGP OPEN message and returns the BGP
+// Identifier as a dotted-quad string. This identifies the BMP speaker when
+// extracted from the Sent OPEN in a Peer Up message.
+// Returns empty string if the data is malformed or too short.
+func extractBGPIDFromBGPOPEN(data []byte) string {
+	if len(data) < 28 {
+		return ""
+	}
+	for i := 0; i < 16; i++ {
+		if data[i] != 0xFF {
+			return ""
+		}
+	}
+	if data[18] != 1 {
+		return ""
+	}
+	return net.IP(data[24:28]).String()
+}
+
+// find4ByteASNCapability scans BGP Optional Parameters for the 4-byte ASN
+// capability (RFC 6793, Capability Code 65). Returns the 4-byte ASN value
+// or 0 if not found.
+//
+// Optional Parameters layout (RFC 5492):
+//
+//	Each parameter: Type(1) + Length(1) + Value(variable)
+//	Type 2 = Capabilities: Value contains one or more capabilities
+//	Each capability: Code(1) + Length(1) + Value(variable)
+//	Code 65, Length 4 = 4-byte ASN capability
+func find4ByteASNCapability(optParams []byte) uint32 {
+	offset := 0
+	for offset+2 <= len(optParams) {
+		paramType := optParams[offset]
+		paramLen := int(optParams[offset+1])
+		offset += 2
+
+		if offset+paramLen > len(optParams) {
+			return 0
+		}
+
+		if paramType == 2 { // Capabilities parameter
+			capData := optParams[offset : offset+paramLen]
+			capOffset := 0
+			for capOffset+2 <= len(capData) {
+				capCode := capData[capOffset]
+				capLen := int(capData[capOffset+1])
+				capOffset += 2
+
+				if capOffset+capLen > len(capData) {
+					break
+				}
+
+				if capCode == 65 && capLen == 4 {
+					return binary.BigEndian.Uint32(capData[capOffset : capOffset+4])
+				}
+
+				capOffset += capLen
+			}
+		}
+
+		offset += paramLen
+	}
+	return 0
 }
 
 // RouterIDFromPeerHeader extracts the router identifier from a BMP per-peer header.

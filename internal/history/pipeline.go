@@ -8,6 +8,7 @@ import (
 
 	"github.com/route-beacon/rib-ingester/internal/bgp"
 	"github.com/route-beacon/rib-ingester/internal/bmp"
+	"github.com/route-beacon/rib-ingester/internal/config"
 	"github.com/route-beacon/rib-ingester/internal/metrics"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"go.uber.org/zap"
@@ -19,15 +20,22 @@ type Pipeline struct {
 	flushInterval   time.Duration
 	maxPayloadBytes int
 	logger          *zap.Logger
+	asnCache        map[string]uint32
+	routerMeta      map[string]config.RouterMeta
 }
 
-func NewPipeline(writer *Writer, batchSize, flushIntervalMs, maxPayloadBytes int, logger *zap.Logger) *Pipeline {
+func NewPipeline(writer *Writer, batchSize, flushIntervalMs, maxPayloadBytes int, logger *zap.Logger, routerMeta map[string]config.RouterMeta) *Pipeline {
+	if routerMeta == nil {
+		routerMeta = make(map[string]config.RouterMeta)
+	}
 	return &Pipeline{
 		writer:          writer,
 		batchSize:       batchSize,
 		flushInterval:   time.Duration(flushIntervalMs) * time.Millisecond,
 		maxPayloadBytes: maxPayloadBytes,
 		logger:          logger,
+		asnCache:        make(map[string]uint32),
+		routerMeta:      routerMeta,
 	}
 }
 
@@ -126,8 +134,12 @@ func (p *Pipeline) processRecord(ctx context.Context, rec *kgo.Record) []*Histor
 
 	var rows []*HistoryRow
 	for _, parsed := range msgs {
-		if parsed.MsgType == bmp.MsgTypeInitiation {
-			p.processInitiation(ctx, rec, parsed, obmpRouterIP)
+		if parsed.MsgType == bmp.MsgTypePeerUp {
+			if parsed.IsLocRIB && parsed.LocalBGPID != "" {
+				p.processLocRIBPeerUp(ctx, rec, parsed)
+			} else if !parsed.IsLocRIB && parsed.LocalASN > 0 {
+				p.processPeerUpASN(ctx, rec, parsed, obmpRouterIP)
+			}
 			continue
 		}
 		if !parsed.IsLocRIB || parsed.MsgType != bmp.MsgTypeRouteMonitoring || parsed.BGPData == nil {
@@ -200,31 +212,76 @@ func (p *Pipeline) processRecord(ctx context.Context, rec *kgo.Record) []*Histor
 	return rows
 }
 
-func (p *Pipeline) processInitiation(ctx context.Context, rec *kgo.Record, parsed *bmp.ParsedBMP, obmpRouterIP string) {
-	metrics.KafkaMessagesTotal.WithLabelValues("history", rec.Topic, "", "initiation").Inc()
+func (p *Pipeline) processLocRIBPeerUp(ctx context.Context, rec *kgo.Record, parsed *bmp.ParsedBMP) {
+	metrics.KafkaMessagesTotal.WithLabelValues("history", rec.Topic, "", "peer_up_locrib").Inc()
 
-	routerIP := obmpRouterIP
-	if routerIP == "" {
-		p.logger.Warn("initiation message has no router IP (legacy OBMP format?)",
-			zap.String("topic", rec.Topic),
+	routerID := parsed.LocalBGPID
+
+	if p.writer == nil || p.writer.pool == nil {
+		p.logger.Info("router registered from Loc-RIB Peer Up (no db)",
+			zap.String("router_id", routerID),
 		)
 		return
 	}
 
-	routerID := routerIP
-	if err := UpsertRouter(ctx, p.writer.pool, routerID, routerIP, parsed.SysName, parsed.SysDescr); err != nil {
-		p.logger.Warn("failed to upsert router from initiation",
+	meta := p.routerMeta[routerID]
+	if err := UpsertRouter(ctx, p.writer.pool, routerID, routerID, "", "", nil, meta.Name, meta.Location); err != nil {
+		p.logger.Warn("failed to upsert router from Loc-RIB Peer Up",
 			zap.String("router_id", routerID),
-			zap.String("sys_name", parsed.SysName),
 			zap.Error(err),
 		)
 		return
 	}
 
-	p.logger.Info("router metadata upserted from BMP initiation",
+	p.logger.Info("router registered from Loc-RIB Peer Up",
 		zap.String("router_id", routerID),
-		zap.String("sys_name", parsed.SysName),
-		zap.String("sys_descr", parsed.SysDescr),
+	)
+}
+
+func (p *Pipeline) processPeerUpASN(ctx context.Context, rec *kgo.Record, parsed *bmp.ParsedBMP, obmpRouterIP string) {
+	// Use the BGP Identifier from the Sent OPEN as the router ID.
+	// The OBMP header's router IP is unreliable for Peer Up messages:
+	// goBMP populates it with the monitored peer's address, not the
+	// BMP speaker's address. The Sent OPEN's BGP ID is the speaker's own
+	// identifier — matching what the Initiation handler stores.
+	routerID := parsed.LocalBGPID
+	if routerID == "" {
+		routerID = obmpRouterIP
+	}
+	if routerID == "" {
+		return
+	}
+	routerIP := routerID
+
+	if p.asnCache[routerID] == parsed.LocalASN {
+		return
+	}
+
+	asn := int64(parsed.LocalASN)
+	if p.writer == nil || p.writer.pool == nil {
+		p.asnCache[routerID] = parsed.LocalASN
+		metrics.KafkaMessagesTotal.WithLabelValues("history", rec.Topic, "", "peer_up_asn").Inc()
+		p.logger.Info("router ASN extracted from BMP Peer Up (no db)",
+			zap.String("router_id", routerID),
+			zap.Uint32("as_number", parsed.LocalASN),
+		)
+		return
+	}
+	meta := p.routerMeta[routerID]
+	if err := UpsertRouter(ctx, p.writer.pool, routerID, routerIP, "", "", &asn, meta.Name, meta.Location); err != nil {
+		p.logger.Warn("failed to upsert router ASN from peer up",
+			zap.String("router_id", routerID),
+			zap.Uint32("as_number", parsed.LocalASN),
+			zap.Error(err),
+		)
+		return
+	}
+
+	p.asnCache[routerID] = parsed.LocalASN
+	metrics.KafkaMessagesTotal.WithLabelValues("history", rec.Topic, "", "peer_up_asn").Inc()
+	p.logger.Info("router ASN extracted from BMP Peer Up",
+		zap.String("router_id", routerID),
+		zap.Uint32("as_number", parsed.LocalASN),
 	)
 }
 
