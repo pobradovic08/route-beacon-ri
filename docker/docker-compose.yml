@@ -7,6 +7,7 @@ services:
       POSTGRES_PASSWORD: rib
     volumes:
       - ../migrations/0001_init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+      - ../migrations/0003_routers.sql:/docker-entrypoint-initdb.d/03_routers.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U rib -d rib"]
       interval: 2s
