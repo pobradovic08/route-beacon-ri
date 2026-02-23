@@ -348,6 +348,9 @@ func (p *Pipeline) updateSyncStatus(ctx context.Context, batch []*HistoryRow) {
 	seen := make(map[key]bool)
 
 	for _, row := range batch {
+		if !row.IsLocRIB {
+			continue
+		}
 		k := key{row.RouterID, row.TableName, row.Event.AFI}
 		if seen[k] {
 			continue
