@@ -105,7 +105,7 @@ FROM adj_rib_in
 GROUP BY router_id, peer_address, peer_asn, is_post_policy, table_name, afi;
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_adj_rib_in_summary_pk
-    ON adj_rib_in_summary (router_id, peer_address, is_post_policy, table_name, afi);
+    ON adj_rib_in_summary (router_id, peer_address, peer_asn, is_post_policy, table_name, afi);
 
 -- ---------------------------------------------------------------------------
 -- 6. View: peers_overview
@@ -128,6 +128,7 @@ GROUP BY a.router_id, r.hostname, a.peer_address, a.peer_asn, a.peer_bgp_id;
 -- ---------------------------------------------------------------------------
 -- 7. Recreate routers_overview with Adj-RIB-In counts
 -- ---------------------------------------------------------------------------
+DROP VIEW IF EXISTS routers_overview;
 CREATE OR REPLACE VIEW routers_overview AS
 WITH known_routers AS (
     SELECT router_id FROM routers

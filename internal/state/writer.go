@@ -3,6 +3,7 @@ package state
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -384,11 +385,18 @@ func (w *Writer) deleteAdjRibInRoute(ctx context.Context, tx pgx.Tx, r *ParsedRo
 	return tag.RowsAffected(), nil
 }
 
-// HandleAdjRibInPeerDown removes all adj_rib_in routes and sync status for a specific peer.
+// HandleAdjRibInPeerDown removes all adj_rib_in routes and sync status for a specific peer
+// within a single transaction (R3-M2: atomicity fix).
 func (w *Writer) HandleAdjRibInPeerDown(ctx context.Context, routerID, peerAddress string) error {
 	start := time.Now()
 
-	tag, err := w.pool.Exec(ctx,
+	tx, err := w.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin adj peer down tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	tag, err := tx.Exec(ctx,
 		`DELETE FROM adj_rib_in WHERE router_id = $1 AND peer_address = $2`,
 		routerID, peerAddress,
 	)
@@ -396,12 +404,16 @@ func (w *Writer) HandleAdjRibInPeerDown(ctx context.Context, routerID, peerAddre
 		return fmt.Errorf("adj_rib_in peer down: %w", err)
 	}
 
-	_, err = w.pool.Exec(ctx,
+	_, err = tx.Exec(ctx,
 		`DELETE FROM adj_rib_in_sync_status WHERE router_id = $1 AND peer_address = $2`,
 		routerID, peerAddress,
 	)
 	if err != nil {
 		return fmt.Errorf("adj_rib_in_sync_status peer down: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit adj peer down tx: %w", err)
 	}
 
 	dur := time.Since(start).Seconds()
@@ -422,10 +434,17 @@ func (w *Writer) HandleAdjRibInPeerDown(ctx context.Context, routerID, peerAddre
 
 // HandleAdjRibInSessionTermination removes ALL adj_rib_in routes and sync status for a router
 // (called when BMP session terminates — Loc-RIB peer down or termination message).
+// Uses a transaction for atomicity (R3-M2 fix).
 func (w *Writer) HandleAdjRibInSessionTermination(ctx context.Context, routerID string) error {
 	start := time.Now()
 
-	tag, err := w.pool.Exec(ctx,
+	tx, err := w.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin adj session termination tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	tag, err := tx.Exec(ctx,
 		`DELETE FROM adj_rib_in WHERE router_id = $1`,
 		routerID,
 	)
@@ -433,12 +452,16 @@ func (w *Writer) HandleAdjRibInSessionTermination(ctx context.Context, routerID 
 		return fmt.Errorf("adj_rib_in session termination: %w", err)
 	}
 
-	_, err = w.pool.Exec(ctx,
+	_, err = tx.Exec(ctx,
 		`DELETE FROM adj_rib_in_sync_status WHERE router_id = $1`,
 		routerID,
 	)
 	if err != nil {
 		return fmt.Errorf("adj_rib_in_sync_status session termination: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit adj session termination tx: %w", err)
 	}
 
 	dur := time.Since(start).Seconds()
@@ -491,11 +514,27 @@ func (w *Writer) HandleAdjRibInEOR(ctx context.Context, routerID, peerAddress, t
 	}
 
 	// Get session_start_time for stale route purge.
+	// If no sync-status row exists (e.g. missed/out-of-order Peer Up), skip
+	// stale purge gracefully instead of hard-failing (R3-H7 fix).
 	var sessionStart *time.Time
 	err = tx.QueryRow(ctx,
 		`SELECT session_start_time FROM adj_rib_in_sync_status WHERE router_id = $1 AND peer_address = $2 AND afi = $3`,
 		routerID, peerAddress, afi,
 	).Scan(&sessionStart)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// No sync-status row — can't determine stale cutoff, skip purge.
+		w.logger.Warn("no adj_rib_in_sync_status row for EOR, skipping stale purge",
+			zap.String("router_id", routerID),
+			zap.String("peer_address", peerAddress),
+			zap.Int("afi", afi),
+		)
+		if err := tx.Commit(ctx); err != nil {
+			return fmt.Errorf("commit adj eor tx: %w", err)
+		}
+		dur := time.Since(start).Seconds()
+		metrics.DBWriteDuration.WithLabelValues("state", "adj_eor").Observe(dur)
+		return nil
+	}
 	if err != nil {
 		return fmt.Errorf("get adj session_start_time: %w", err)
 	}

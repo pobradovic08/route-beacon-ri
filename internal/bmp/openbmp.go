@@ -97,6 +97,30 @@ func decodeV17(data []byte, maxPayloadBytes int) ([]byte, error) {
 	return data[hdrLen:totalLen], nil
 }
 
+// RouterHashFromOpenBMPV17 extracts the 16-byte router hash from an OpenBMP
+// v1.7 header as a hex string. The router hash is per-(router, peer) in goBMP:
+// each BMP speaker + monitored peer combination produces a unique hash. This
+// makes it suitable as a cache key for correlating Peer Up and Route Monitoring
+// messages from the same peer on the same router.
+// Returns empty string if the data is not v1.7 or is too short.
+func RouterHashFromOpenBMPV17(data []byte) string {
+	if len(data) < openBMPV17MinHdrSize {
+		return ""
+	}
+	if binary.BigEndian.Uint32(data[0:4]) != openBMPV17Magic {
+		return ""
+	}
+	if len(data) < 40 {
+		return ""
+	}
+	adminIDLen := int(binary.BigEndian.Uint16(data[38:40]))
+	hashOffset := 40 + adminIDLen
+	if len(data) < hashOffset+16 {
+		return ""
+	}
+	return fmt.Sprintf("%x", data[hashOffset:hashOffset+16])
+}
+
 // RouterIPFromOpenBMPV17 extracts the router IP from an OpenBMP v1.7 header.
 // Returns empty string if the data is not v1.7 or is too short.
 //

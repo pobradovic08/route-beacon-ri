@@ -22,6 +22,10 @@ type Pipeline struct {
 	logger          *zap.Logger
 	asnCache        map[string]uint32
 	routerMeta      map[string]config.RouterMeta
+	// routerIDCache maps OBMP router hash → real router BGP ID (from Peer Up
+	// Sent OPEN). goBMP generates a unique router hash per (router, peer)
+	// combination, making it a reliable correlation key across message types.
+	routerIDCache map[string]string
 }
 
 func NewPipeline(writer *Writer, batchSize, flushIntervalMs, maxPayloadBytes int, logger *zap.Logger, routerMeta map[string]config.RouterMeta) *Pipeline {
@@ -36,6 +40,7 @@ func NewPipeline(writer *Writer, batchSize, flushIntervalMs, maxPayloadBytes int
 		logger:          logger,
 		asnCache:        make(map[string]uint32),
 		routerMeta:      routerMeta,
+		routerIDCache:   make(map[string]string),
 	}
 }
 
@@ -131,6 +136,7 @@ func (p *Pipeline) processRecord(ctx context.Context, rec *kgo.Record) []*Histor
 	}
 
 	obmpRouterIP := bmp.RouterIPFromOpenBMPV17(rec.Value)
+	obmpRouterHash := bmp.RouterHashFromOpenBMPV17(rec.Value)
 
 	var rows []*HistoryRow
 	for _, parsed := range msgs {
@@ -138,7 +144,7 @@ func (p *Pipeline) processRecord(ctx context.Context, rec *kgo.Record) []*Histor
 			if parsed.IsLocRIB && parsed.LocalBGPID != "" {
 				p.processLocRIBPeerUp(ctx, rec, parsed)
 			} else if !parsed.IsLocRIB && parsed.LocalASN > 0 {
-				p.processPeerUpASN(ctx, rec, parsed, obmpRouterIP)
+				p.processPeerUpASN(ctx, rec, parsed, obmpRouterIP, obmpRouterHash)
 			}
 			continue
 		}
@@ -185,6 +191,11 @@ func (p *Pipeline) processRecord(ctx context.Context, rec *kgo.Record) []*Histor
 			}
 		} else {
 			routerID = obmpRouterIP
+			if obmpRouterHash != "" {
+				if cached, ok := p.routerIDCache[obmpRouterHash]; ok {
+					routerID = cached
+				}
+			}
 		}
 
 		tableName := parsed.TableName
@@ -255,7 +266,7 @@ func (p *Pipeline) processLocRIBPeerUp(ctx context.Context, rec *kgo.Record, par
 	)
 }
 
-func (p *Pipeline) processPeerUpASN(ctx context.Context, rec *kgo.Record, parsed *bmp.ParsedBMP, obmpRouterIP string) {
+func (p *Pipeline) processPeerUpASN(ctx context.Context, rec *kgo.Record, parsed *bmp.ParsedBMP, obmpRouterIP, obmpRouterHash string) {
 	// Use the BGP Identifier from the Sent OPEN as the router ID.
 	// The OBMP header's router IP is unreliable for Peer Up messages:
 	// goBMP populates it with the monitored peer's address, not the
@@ -267,6 +278,10 @@ func (p *Pipeline) processPeerUpASN(ctx context.Context, rec *kgo.Record, parsed
 	}
 	if routerID == "" {
 		return
+	}
+	// Cache: OBMP router hash → real router BGP ID
+	if obmpRouterHash != "" {
+		p.routerIDCache[obmpRouterHash] = routerID
 	}
 	routerIP := routerID
 

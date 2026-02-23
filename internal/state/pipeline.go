@@ -22,6 +22,10 @@ type Pipeline struct {
 	maxPayloadBytes int
 	logger          *zap.Logger
 	routerMeta      map[string]config.RouterMeta
+	// routerIDCache maps OBMP router hash → real router BGP ID (from Peer Up
+	// Sent OPEN). goBMP generates a unique router hash per (router, peer)
+	// combination, making it a reliable correlation key across message types.
+	routerIDCache map[string]string
 }
 
 func NewPipeline(writer *Writer, batchSize int, flushIntervalMs int, rawMode bool, maxPayloadBytes int, logger *zap.Logger, routerMeta map[string]config.RouterMeta) *Pipeline {
@@ -36,7 +40,30 @@ func NewPipeline(writer *Writer, batchSize int, flushIntervalMs int, rawMode boo
 		maxPayloadBytes: maxPayloadBytes,
 		logger:          logger,
 		routerMeta:      routerMeta,
+		routerIDCache:   make(map[string]string),
 	}
+}
+
+type recordAction int
+
+const (
+	actionRoute            recordAction = iota
+	actionEOR
+	actionPeerDown
+	actionAdjRibInRoute    // Adj-RIB-In route add/withdraw
+	actionAdjRibInEOR      // Adj-RIB-In End-of-RIB
+	actionAdjRibInPeerDown // Non-Loc-RIB peer down
+)
+
+// processedRecord holds the results of processing a single Kafka record.
+// Routes are separated by type (Loc-RIB vs Adj-RIB-In) so Run() can
+// dispatch them to the correct batch without last-writer-wins corruption
+// when a single raw record contains both Loc-RIB and non-Loc-RIB messages.
+type processedRecord struct {
+	locRoutes []*ParsedRoute
+	adjRoutes []*ParsedRoute
+	locAction recordAction
+	adjAction recordAction
 }
 
 // Run processes records from the channel until context is cancelled.
@@ -75,9 +102,9 @@ func (p *Pipeline) Run(ctx context.Context, records <-chan []*kgo.Record, flushe
 			}
 
 			for _, rec := range recs {
-				routes, action := p.processRecord(ctx, rec)
+				result := p.processRecord(ctx, rec)
 
-				if len(routes) == 0 {
+				if len(result.locRoutes) == 0 && len(result.adjRoutes) == 0 {
 					// Always track the record for offset commit, even if
 					// parsing failed or the message was filtered. This
 					// prevents unparseable records from stalling partition
@@ -86,117 +113,146 @@ func (p *Pipeline) Run(ctx context.Context, records <-chan []*kgo.Record, flushe
 					continue
 				}
 
-				switch action {
-				case actionRoute:
-					batchRecords = append(batchRecords, rec)
-					batch = append(batch, routes...)
-				case actionEOR:
-					// A raw record may contain both regular routes and
-					// EOR markers. Separate them, flush routes first,
-					// then handle each EOR.
-					for _, r := range routes {
-						if !r.IsEOR {
-							batch = append(batch, r)
-						}
-					}
-					if len(batch) > 0 {
-						if err := p.writer.FlushBatch(ctx, batch); err != nil {
-							p.logger.Error("pre-eor flush failed", zap.Error(err))
-							continue
-						}
-						batch = nil
-					}
-					eorFailed := false
-					for _, r := range routes {
-						if !r.IsEOR {
-							continue
-						}
-						if err := p.writer.HandleEOR(ctx, r.RouterID, r.TableName, r.AFI); err != nil {
-							p.logger.Error("EOR handling failed", zap.Error(err))
-							eorFailed = true
-						}
-					}
-					// Only commit offsets if all EOR handlers succeeded.
-					if eorFailed {
-						continue
-					}
-					batchRecords = append(batchRecords, rec)
-					if len(batchRecords) > 0 {
-						select {
-						case flushed <- batchRecords:
-						case <-ctx.Done():
-						}
-						batchRecords = nil
-					}
-				case actionPeerDown:
-					// Flush pending routes to DB before session termination.
-					if len(batch) > 0 {
-						if err := p.writer.FlushBatch(ctx, batch); err != nil {
-							p.logger.Error("pre-peerdown flush failed", zap.Error(err))
-							continue
-						}
-						batch = nil
-					}
-					if err := p.writer.HandleSessionTermination(ctx, routes[0].RouterID, routes[0].TableName); err != nil {
-						p.logger.Error("session termination failed", zap.Error(err))
-					} else {
-						// Also purge all adj_rib_in for the router since BMP session loss
-						// means all peer monitoring data is stale.
-						if err := p.writer.HandleAdjRibInSessionTermination(ctx, routes[0].RouterID); err != nil {
-							p.logger.Error("adj_rib_in session purge failed", zap.Error(err))
-						}
-						adjBatch = nil // Clear any pending adj routes for this router.
-						batchRecords = append(batchRecords, rec)
-						if len(batchRecords) > 0 {
-							select {
-							case flushed <- batchRecords:
-							case <-ctx.Done():
+				skipRecord := false
+				needsImmediateCommit := false
+
+				// --- Handle Adj-RIB-In first ---
+				// Process adj routes before Loc-RIB to ensure pending adj data
+				// is flushed before a Loc-RIB PeerDown purges it.
+				if len(result.adjRoutes) > 0 {
+					switch result.adjAction {
+					case actionAdjRibInRoute:
+						adjBatch = append(adjBatch, result.adjRoutes...)
+
+					case actionAdjRibInEOR:
+						// Separate non-EOR routes from EOR markers
+						// and add them to adjBatch before flushing.
+						for _, r := range result.adjRoutes {
+							if !r.IsEOR {
+								adjBatch = append(adjBatch, r)
 							}
-							batchRecords = nil
 						}
+						if len(adjBatch) > 0 {
+							if err := p.writer.FlushAdjRibInBatch(ctx, adjBatch); err != nil {
+								p.logger.Error("pre-adj-eor flush failed", zap.Error(err))
+								skipRecord = true
+								break
+							}
+							adjBatch = nil
+						}
+						eorFailed := false
+						for _, r := range result.adjRoutes {
+							if !r.IsEOR {
+								continue
+							}
+							if err := p.writer.HandleAdjRibInEOR(ctx, r.RouterID, r.PeerAddress, r.TableName, r.AFI); err != nil {
+								p.logger.Error("adj_rib_in EOR handling failed", zap.Error(err))
+								eorFailed = true
+							}
+						}
+						if eorFailed {
+							skipRecord = true
+						} else {
+							needsImmediateCommit = true
+						}
+
+					case actionAdjRibInPeerDown:
+						// Flush pending adj batch to persist routes from other routers.
+						if len(adjBatch) > 0 {
+							if err := p.writer.FlushAdjRibInBatch(ctx, adjBatch); err != nil {
+								p.logger.Error("pre-adj-peerdown flush failed", zap.Error(err))
+								skipRecord = true
+								break
+							}
+							adjBatch = nil
+						}
+						if err := p.writer.HandleAdjRibInPeerDown(ctx, result.adjRoutes[0].RouterID, result.adjRoutes[0].PeerAddress); err != nil {
+							p.logger.Error("adj_rib_in peer down failed", zap.Error(err))
+						}
+						needsImmediateCommit = true
 					}
+				}
 
-				case actionAdjRibInRoute:
-					batchRecords = append(batchRecords, rec)
-					adjBatch = append(adjBatch, routes...)
+				if skipRecord {
+					continue
+				}
 
-				case actionAdjRibInEOR:
-					// Flush pending adj_rib_in routes, then purge stale.
-					if len(adjBatch) > 0 {
-						if err := p.writer.FlushAdjRibInBatch(ctx, adjBatch); err != nil {
-							p.logger.Error("pre-adj-eor flush failed", zap.Error(err))
+				// --- Handle Loc-RIB ---
+				if len(result.locRoutes) > 0 {
+					switch result.locAction {
+					case actionRoute:
+						batch = append(batch, result.locRoutes...)
+
+					case actionEOR:
+						// A raw record may contain both regular routes and
+						// EOR markers. Separate them, flush routes first,
+						// then handle each EOR.
+						for _, r := range result.locRoutes {
+							if !r.IsEOR {
+								batch = append(batch, r)
+							}
+						}
+						if len(batch) > 0 {
+							if err := p.writer.FlushBatch(ctx, batch); err != nil {
+								p.logger.Error("pre-eor flush failed", zap.Error(err))
+								continue
+							}
+							batch = nil
+						}
+						eorFailed := false
+						for _, r := range result.locRoutes {
+							if !r.IsEOR {
+								continue
+							}
+							if err := p.writer.HandleEOR(ctx, r.RouterID, r.TableName, r.AFI); err != nil {
+								p.logger.Error("EOR handling failed", zap.Error(err))
+								eorFailed = true
+							}
+						}
+						// Only commit offsets if all EOR handlers succeeded.
+						if eorFailed {
 							continue
 						}
-						adjBatch = nil
-					}
-					eorFailed := false
-					for _, r := range routes {
-						if !r.IsEOR {
-							continue
-						}
-						if err := p.writer.HandleAdjRibInEOR(ctx, r.RouterID, r.PeerAddress, r.TableName, r.AFI); err != nil {
-							p.logger.Error("adj_rib_in EOR handling failed", zap.Error(err))
-							eorFailed = true
-						}
-					}
-					if !eorFailed {
-						batchRecords = append(batchRecords, rec)
-					}
+						needsImmediateCommit = true
 
-				case actionAdjRibInPeerDown:
-					// Flush pending adj_rib_in routes, then delete peer's routes.
-					if len(adjBatch) > 0 {
-						if err := p.writer.FlushAdjRibInBatch(ctx, adjBatch); err != nil {
-							p.logger.Error("pre-adj-peerdown flush failed", zap.Error(err))
-							continue
+					case actionPeerDown:
+						// Flush pending adj batch to persist routes from other routers
+						// before clearing (R3-H2 fix).
+						if len(adjBatch) > 0 {
+							if err := p.writer.FlushAdjRibInBatch(ctx, adjBatch); err != nil {
+								p.logger.Error("pre-peerdown adj flush failed", zap.Error(err))
+							}
+							adjBatch = nil
 						}
-						adjBatch = nil
+						// Flush pending Loc-RIB routes to DB before session termination.
+						if len(batch) > 0 {
+							if err := p.writer.FlushBatch(ctx, batch); err != nil {
+								p.logger.Error("pre-peerdown flush failed", zap.Error(err))
+								continue
+							}
+							batch = nil
+						}
+						if err := p.writer.HandleSessionTermination(ctx, result.locRoutes[0].RouterID, result.locRoutes[0].TableName); err != nil {
+							p.logger.Error("session termination failed", zap.Error(err))
+						} else {
+							// Also purge all adj_rib_in for the router since BMP session loss
+							// means all peer monitoring data is stale.
+							if err := p.writer.HandleAdjRibInSessionTermination(ctx, result.locRoutes[0].RouterID); err != nil {
+								p.logger.Error("adj_rib_in session purge failed", zap.Error(err))
+							}
+						}
+						needsImmediateCommit = true
 					}
-					if err := p.writer.HandleAdjRibInPeerDown(ctx, routes[0].RouterID, routes[0].PeerAddress); err != nil {
-						p.logger.Error("adj_rib_in peer down failed", zap.Error(err))
-					} else {
-						batchRecords = append(batchRecords, rec)
+				}
+
+				batchRecords = append(batchRecords, rec)
+
+				if needsImmediateCommit && len(batchRecords) > 0 {
+					select {
+					case flushed <- batchRecords:
+					case <-ctx.Done():
 					}
+					batchRecords = nil
 				}
 			}
 
@@ -239,18 +295,7 @@ func (p *Pipeline) Run(ctx context.Context, records <-chan []*kgo.Record, flushe
 	}
 }
 
-type recordAction int
-
-const (
-	actionRoute             recordAction = iota
-	actionEOR
-	actionPeerDown
-	actionAdjRibInRoute     // Adj-RIB-In route add/withdraw
-	actionAdjRibInEOR       // Adj-RIB-In End-of-RIB
-	actionAdjRibInPeerDown  // Non-Loc-RIB peer down
-)
-
-func (p *Pipeline) processRecord(ctx context.Context, rec *kgo.Record) ([]*ParsedRoute, recordAction) {
+func (p *Pipeline) processRecord(ctx context.Context, rec *kgo.Record) *processedRecord {
 	if p.rawMode {
 		return p.processRawRecord(ctx, rec)
 	}
@@ -275,12 +320,12 @@ func (p *Pipeline) processRecord(ctx context.Context, rec *kgo.Record) ([]*Parse
 			zap.String("topic", topic),
 			zap.Error(err),
 		)
-		return nil, actionRoute
+		return &processedRecord{}
 	}
 
 	// Filter: only process Loc-RIB messages.
 	if !parsed.IsLocRIB {
-		return nil, actionRoute
+		return &processedRecord{}
 	}
 
 	afiStr := fmt.Sprintf("%d", parsed.AFI)
@@ -288,13 +333,19 @@ func (p *Pipeline) processRecord(ctx context.Context, rec *kgo.Record) ([]*Parse
 	metrics.LastMsgTimestamp.WithLabelValues("state", parsed.RouterID, parsed.TableName, afiStr).SetToCurrentTime()
 
 	if parsed.IsEOR {
-		return []*ParsedRoute{parsed}, actionEOR
+		return &processedRecord{
+			locRoutes: []*ParsedRoute{parsed},
+			locAction: actionEOR,
+		}
 	}
 
-	return []*ParsedRoute{parsed}, actionRoute
+	return &processedRecord{
+		locRoutes: []*ParsedRoute{parsed},
+		locAction: actionRoute,
+	}
 }
 
-func (p *Pipeline) processPeerRecord(ctx context.Context, rec *kgo.Record) ([]*ParsedRoute, recordAction) {
+func (p *Pipeline) processPeerRecord(ctx context.Context, rec *kgo.Record) *processedRecord {
 	pe, err := DecodePeerMessage(rec.Value)
 	if err != nil {
 		metrics.ParseErrorsTotal.WithLabelValues("json", "peer_decode").Inc()
@@ -302,11 +353,11 @@ func (p *Pipeline) processPeerRecord(ctx context.Context, rec *kgo.Record) ([]*P
 			zap.String("topic", rec.Topic),
 			zap.Error(err),
 		)
-		return nil, actionRoute
+		return &processedRecord{}
 	}
 
 	if !pe.IsLocRIB {
-		return nil, actionRoute
+		return &processedRecord{}
 	}
 
 	if pe.Action == "peer_up" {
@@ -322,18 +373,21 @@ func (p *Pipeline) processPeerRecord(ctx context.Context, rec *kgo.Record) ([]*P
 				)
 			}
 		}
-		return nil, actionRoute
+		return &processedRecord{}
 	}
 
 	if pe.Action == "peer_down" {
 		metrics.KafkaMessagesTotal.WithLabelValues("state", rec.Topic, "", "peer_down").Inc()
-		return []*ParsedRoute{{RouterID: pe.RouterID, TableName: pe.TableName}}, actionPeerDown
+		return &processedRecord{
+			locRoutes: []*ParsedRoute{{RouterID: pe.RouterID, TableName: pe.TableName}},
+			locAction: actionPeerDown,
+		}
 	}
 
-	return nil, actionRoute
+	return &processedRecord{}
 }
 
-func (p *Pipeline) processRawRecord(ctx context.Context, rec *kgo.Record) ([]*ParsedRoute, recordAction) {
+func (p *Pipeline) processRawRecord(ctx context.Context, rec *kgo.Record) *processedRecord {
 	bmpBytes, err := bmp.DecodeOpenBMPFrame(rec.Value, p.maxPayloadBytes)
 	if err != nil {
 		metrics.ParseErrorsTotal.WithLabelValues("raw", "openbmp_decode").Inc()
@@ -341,7 +395,7 @@ func (p *Pipeline) processRawRecord(ctx context.Context, rec *kgo.Record) ([]*Pa
 			zap.String("topic", rec.Topic),
 			zap.Error(err),
 		)
-		return nil, actionRoute
+		return &processedRecord{}
 	}
 
 	// A single raw Kafka record may contain multiple concatenated BMP
@@ -353,18 +407,21 @@ func (p *Pipeline) processRawRecord(ctx context.Context, rec *kgo.Record) ([]*Pa
 			zap.String("topic", rec.Topic),
 			zap.Error(err),
 		)
-		return nil, actionRoute
+		return &processedRecord{}
 	}
 
-	// Extract router ID from the OpenBMP v1.7 header (fallback for Loc-RIB).
+	// Extract router IP and router hash from the OpenBMP v1.7 header.
+	// Router IP is a fallback for Loc-RIB identity. Router hash is the
+	// correlation key for non-Loc-RIB messages (unique per router+peer).
 	obmpRouterIP := bmp.RouterIPFromOpenBMPV17(rec.Value)
+	obmpRouterHash := bmp.RouterHashFromOpenBMPV17(rec.Value)
 
-	var routes []*ParsedRoute
-	finalAction := actionRoute
+	var result processedRecord
 
+msgLoop:
 	for _, parsed := range msgs {
 		if parsed.IsLocRIB {
-			// --- Loc-RIB path (UNCHANGED) ---
+			// --- Loc-RIB path (peer type 3) ---
 			peerHdrOffset := parsed.Offset + bmp.CommonHeaderSize
 			routerID := bmp.RouterIDFromPeerHeader(bmpBytes[peerHdrOffset:])
 			if routerID == "" || routerID == "::" || routerID == "0.0.0.0" {
@@ -395,9 +452,9 @@ func (p *Pipeline) processRawRecord(ctx context.Context, rec *kgo.Record) ([]*Pa
 					zap.String("table_name", parsed.TableName),
 					zap.Uint8("reason_code", parsed.PeerDownReason),
 				)
-				finalAction = actionPeerDown
-				routes = append(routes, &ParsedRoute{RouterID: routerID, TableName: parsed.TableName})
-				break
+				result.locAction = actionPeerDown
+				result.locRoutes = append(result.locRoutes, &ParsedRoute{RouterID: routerID, TableName: parsed.TableName})
+				break msgLoop
 			}
 
 			if parsed.MsgType != bmp.MsgTypeRouteMonitoring || parsed.BGPData == nil {
@@ -431,14 +488,14 @@ func (p *Pipeline) processRawRecord(ctx context.Context, rec *kgo.Record) ([]*Pa
 				afiStr := fmt.Sprintf("%d", afi)
 				metrics.KafkaMessagesTotal.WithLabelValues("state", rec.Topic, afiStr, "eor").Inc()
 				metrics.LastMsgTimestamp.WithLabelValues("state", routerID, parsed.TableName, afiStr).SetToCurrentTime()
-				routes = append(routes, &ParsedRoute{
+				result.locRoutes = append(result.locRoutes, &ParsedRoute{
 					RouterID:  routerID,
 					TableName: parsed.TableName,
 					AFI:       afi,
 					IsLocRIB:  true,
 					IsEOR:     true,
 				})
-				finalAction = actionEOR
+				result.locAction = actionEOR
 				continue
 			}
 
@@ -472,23 +529,46 @@ func (p *Pipeline) processRawRecord(ctx context.Context, rec *kgo.Record) ([]*Pa
 					}
 					r.Attrs = attrs
 				}
-				routes = append(routes, r)
+				result.locRoutes = append(result.locRoutes, r)
+			}
+			if result.locAction != actionEOR {
+				result.locAction = actionRoute
 			}
 		} else {
 			// --- Adj-RIB-In path (peer types 0/1/2) ---
-			// For non-Loc-RIB, router ID comes from OBMP header (the BMP speaker),
-			// NOT from per-peer header offset 30 (which is the peer's BGP ID).
+			// goBMP populates the OBMP header router IP with the monitored
+			// peer's address instead of the BMP speaker's for non-Loc-RIB
+			// messages. Use routerIDCache keyed by OBMP router hash
+			// (unique per router+peer) to resolve the real router identity.
 			routerID := obmpRouterIP
+			if obmpRouterHash != "" {
+				if cached, ok := p.routerIDCache[obmpRouterHash]; ok {
+					routerID = cached
+				}
+			}
 
 			switch parsed.MsgType {
 			case bmp.MsgTypePeerUp:
-				// Non-Loc-RIB Peer Up: record session start for stale route tracking.
+				// Non-Loc-RIB Peer Up: extract real router ID from Sent OPEN
+				// BGP Identifier and cache it for subsequent messages.
 				metrics.KafkaMessagesTotal.WithLabelValues("state", rec.Topic, "", "adj_peer_up").Inc()
+				peerUpRouterID := parsed.LocalBGPID
+				if peerUpRouterID == "" {
+					peerUpRouterID = obmpRouterIP
+				}
+				if peerUpRouterID == "" {
+					continue
+				}
+				// Cache: OBMP router hash → real router BGP ID
+				if obmpRouterHash != "" {
+					p.routerIDCache[obmpRouterHash] = peerUpRouterID
+				}
+				routerID = peerUpRouterID
 				if p.writer != nil {
 					for _, afi := range []int{4, 6} {
-						if err := p.writer.UpdateAdjRibInSessionStart(ctx, routerID, parsed.PeerAddress, afi); err != nil {
+						if err := p.writer.UpdateAdjRibInSessionStart(ctx, peerUpRouterID, parsed.PeerAddress, afi); err != nil {
 							p.logger.Error("UpdateAdjRibInSessionStart failed",
-								zap.String("router_id", routerID),
+								zap.String("router_id", peerUpRouterID),
 								zap.String("peer_address", parsed.PeerAddress),
 								zap.Int("afi", afi),
 								zap.Error(err),
@@ -506,15 +586,15 @@ func (p *Pipeline) processRawRecord(ctx context.Context, rec *kgo.Record) ([]*Pa
 					zap.String("peer_address", parsed.PeerAddress),
 					zap.Uint8("reason_code", parsed.PeerDownReason),
 				)
-				finalAction = actionAdjRibInPeerDown
-				routes = append(routes, &ParsedRoute{
+				result.adjAction = actionAdjRibInPeerDown
+				result.adjRoutes = append(result.adjRoutes, &ParsedRoute{
 					RouterID:     routerID,
 					PeerAddress:  parsed.PeerAddress,
 					PeerAS:       parsed.PeerAS,
 					PeerBGPID:    parsed.PeerBGPID,
 					IsPostPolicy: parsed.IsPostPolicy,
 				})
-				continue
+				break msgLoop
 
 			case bmp.MsgTypeRouteMonitoring:
 				if parsed.BGPData == nil {
@@ -541,7 +621,7 @@ func (p *Pipeline) processRawRecord(ctx context.Context, rec *kgo.Record) ([]*Pa
 						tableName = ""
 					}
 
-					routes = append(routes, &ParsedRoute{
+					result.adjRoutes = append(result.adjRoutes, &ParsedRoute{
 						RouterID:     routerID,
 						PeerAddress:  parsed.PeerAddress,
 						PeerAS:       parsed.PeerAS,
@@ -551,7 +631,7 @@ func (p *Pipeline) processRawRecord(ctx context.Context, rec *kgo.Record) ([]*Pa
 						AFI:          afi,
 						IsEOR:        true,
 					})
-					finalAction = actionAdjRibInEOR
+					result.adjAction = actionAdjRibInEOR
 					continue
 				}
 
@@ -564,7 +644,7 @@ func (p *Pipeline) processRawRecord(ctx context.Context, rec *kgo.Record) ([]*Pa
 					afiStr := fmt.Sprintf("%d", ev.AFI)
 					metrics.KafkaMessagesTotal.WithLabelValues("state", rec.Topic, afiStr, "adj_"+ev.Action).Inc()
 
-					routes = append(routes, &ParsedRoute{
+					r := &ParsedRoute{
 						RouterID:     routerID,
 						PeerAddress:  parsed.PeerAddress,
 						PeerAS:       parsed.PeerAS,
@@ -584,18 +664,24 @@ func (p *Pipeline) processRawRecord(ctx context.Context, rec *kgo.Record) ([]*Pa
 						CommStd:      ev.CommStd,
 						CommExt:      ev.CommExt,
 						CommLarge:    ev.CommLarge,
-					})
+					}
+					if len(ev.Attrs) > 0 {
+						attrs := make(map[string]any, len(ev.Attrs))
+						for k, v := range ev.Attrs {
+							attrs[k] = v
+						}
+						r.Attrs = attrs
+					}
+					result.adjRoutes = append(result.adjRoutes, r)
 				}
-				finalAction = actionAdjRibInRoute
+				if result.adjAction != actionAdjRibInEOR {
+					result.adjAction = actionAdjRibInRoute
+				}
 			}
 		}
 	}
 
-	if len(routes) == 0 {
-		return nil, actionRoute
-	}
-
-	return routes, finalAction
+	return &result
 }
 
 func (p *Pipeline) flushAll(ctx context.Context, batch, adjBatch []*ParsedRoute, records []*kgo.Record, flushed chan<- []*kgo.Record) error {
