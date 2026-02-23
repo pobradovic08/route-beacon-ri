@@ -4,7 +4,7 @@ Database used by the `rib-ingester` service. The API layer reads from these tabl
 
 **PostgreSQL version:** 16
 **Required extension:** `btree_gist` (for GiST indexing on `inet`/`cidr` types)
-**Migration:** `migrations/0001_init.sql`
+**Migrations:** `migrations/0001_init.sql`, `0003_routers.sql`, `0004_router_metadata.sql`, `0005_adj_rib_in.sql`
 
 ---
 
@@ -12,19 +12,21 @@ Database used by the `rib-ingester` service. The API layer reads from these tabl
 
 ### `routers`
 
-Router metadata populated from BMP Initiation messages (RFC 7854 §4.3). One row per monitored router. Updated each time the ingester receives a new BMP session initiation.
+Router metadata populated from BMP Peer Up messages (Sent OPEN BGP Identifier and ASN) and operator-provided config (display name, location). One row per monitored router. Updated each time the ingester processes a Peer Up message.
 
 | Column | Type | Nullable | Default | Description |
 |--------|------|----------|---------|-------------|
-| `router_id` | `TEXT` | **PK** | — | Router identifier. Typically the BGP Router ID (e.g. `10.0.0.2`). |
+| `router_id` | `TEXT` | **PK** | — | Router identifier. The BGP Router ID from the Sent OPEN message (e.g. `10.0.0.2`). |
 | `router_ip` | `INET` | yes | `NULL` | IP address the router connected from. |
 | `hostname` | `TEXT` | yes | `NULL` | From BMP Initiation TLV type 2 (`sysName`). |
-| `as_number` | `BIGINT` | yes | `NULL` | Router's autonomous system number. |
+| `as_number` | `BIGINT` | yes | `NULL` | Router's autonomous system number (from Peer Up Sent OPEN). |
 | `description` | `TEXT` | yes | `NULL` | From BMP Initiation TLV type 1 (`sysDescr`). |
+| `display_name` | `TEXT` | yes | `NULL` | Operator-provided display name (from config file). |
+| `location` | `TEXT` | yes | `NULL` | Operator-provided location (from config file). |
 | `first_seen` | `TIMESTAMPTZ` | no | `now()` | When this router was first observed. Never overwritten on update. |
-| `last_seen` | `TIMESTAMPTZ` | no | `now()` | Last BMP Initiation received. Updated on every new session. |
+| `last_seen` | `TIMESTAMPTZ` | no | `now()` | Last BMP Peer Up received. Updated on every new session. |
 
-**Upsert behavior:** `ON CONFLICT (router_id)` updates `router_ip`, `hostname`, `description` (using `COALESCE` to preserve non-null values) and sets `last_seen = now()`. `first_seen` is never overwritten.
+**Upsert behavior:** `ON CONFLICT (router_id)` updates `router_ip`, `hostname`, `as_number`, `description`, `display_name`, `location` (using `COALESCE` to preserve non-null values) and sets `last_seen = now()`. `first_seen` is never overwritten.
 
 ---
 
@@ -75,9 +77,65 @@ Current Loc-RIB state — one row per active route. This is the primary table fo
 
 ---
 
+### `adj_rib_in`
+
+Per-peer Adj-RIB-In state — one row per route received from each BGP neighbor. Unlike `current_routes` (which stores only the best path selected by the router), this table stores **all candidate routes from every peer**, including pre-policy and post-policy views. The ingester upserts on add, deletes on withdraw, and removes all routes for a peer on BMP Peer Down.
+
+| Column | Type | Nullable | Default | Description |
+|--------|------|----------|---------|-------------|
+| `router_id` | `TEXT` | **PK** | — | FK-like reference to `routers.router_id`. The BMP speaker. |
+| `peer_address` | `INET` | **PK** | — | IP address of the BGP neighbor that sent this route. |
+| `peer_asn` | `BIGINT` | no | — | Autonomous system number of the BGP neighbor. |
+| `peer_bgp_id` | `TEXT` | no | `''` | BGP identifier of the peer (from the BMP per-peer header). Empty string if unavailable. |
+| `is_post_policy` | `BOOLEAN` | **PK** | — | `false` = pre-policy (Adj-RIB-In, peer type 0), `true` = post-policy (Adj-RIB-In-Post, peer type 1). |
+| `table_name` | `TEXT` | **PK** | — | BMP table name. |
+| `afi` | `SMALLINT` | **PK** | — | Address family: `4` = IPv4, `6` = IPv6. CHECK constraint enforces these values. |
+| `prefix` | `CIDR` | **PK** | — | Network prefix in CIDR notation. |
+| `path_id` | `BIGINT` | **PK** | `0` | BGP Add-Path path identifier. `0` when Add-Path is not in use. |
+| `nexthop` | `INET` | yes | `NULL` | BGP next-hop address. |
+| `as_path` | `TEXT` | yes | `NULL` | Space-delimited AS path. |
+| `origin` | `TEXT` | yes | `NULL` | BGP origin attribute: `"IGP"`, `"EGP"`, or `"INCOMPLETE"`. |
+| `localpref` | `INTEGER` | yes | `NULL` | LOCAL_PREF value. |
+| `med` | `INTEGER` | yes | `NULL` | Multi-Exit Discriminator. |
+| `origin_asn` | `INTEGER` | yes | `NULL` | Last ASN in `as_path` (the origin AS). Derived by the ingester. |
+| `communities_std` | `TEXT[]` | yes | `NULL` | Standard BGP communities in `ASN:value` format. |
+| `communities_ext` | `TEXT[]` | yes | `NULL` | Extended communities. |
+| `communities_large` | `TEXT[]` | yes | `NULL` | Large BGP communities. |
+| `attrs` | `JSONB` | yes | `NULL` | Extra BGP path attributes not mapped to dedicated columns. |
+| `first_seen` | `TIMESTAMPTZ` | no | `now()` | When this route was first inserted. Preserved across upserts. |
+| `updated_at` | `TIMESTAMPTZ` | no | `now()` | Last time this route was inserted or updated. |
+
+**Primary key:** `(router_id, peer_address, is_post_policy, table_name, afi, prefix, path_id)`
+
+**Upsert behavior:** `ON CONFLICT` updates all attribute columns and sets `updated_at = now()`. `first_seen` is preserved.
+
+**Deletion:**
+- BGP withdraw (`action = 'D'`): deletes the specific route by full PK.
+- BMP Peer Down: deletes **all** routes for that `(router_id, peer_address)` pair.
+- BMP session termination: deletes **all** `adj_rib_in` rows for that `router_id`.
+
+#### Indexes
+
+| Index | Type | Columns | Use Case |
+|-------|------|---------|----------|
+| `idx_adj_rib_in_prefix_gist` | GiST (`inet_ops`) | `prefix` | Subnet containment queries: `WHERE prefix >>= '10.1.2.3/32'` |
+| `idx_adj_rib_in_prefix_btree` | B-tree | `prefix` | Exact prefix lookups across all peers |
+| `idx_adj_rib_in_router_peer` | B-tree | `(router_id, peer_address)` | Per-peer route listing, Peer Down bulk deletion |
+| `idx_adj_rib_in_router_table_afi` | B-tree | `(router_id, table_name, afi)` | Per-router lookups, session termination deletion |
+| `idx_adj_rib_in_comm_std_gin` | GIN | `communities_std` | Filter by standard community |
+| `idx_adj_rib_in_comm_ext_gin` | GIN | `communities_ext` | Filter by extended community |
+| `idx_adj_rib_in_comm_large_gin` | GIN | `communities_large` | Filter by large community |
+| `idx_adj_rib_in_origin_asn` | B-tree | `origin_asn` | "Routes originated by AS X from all peers" |
+| `idx_adj_rib_in_nexthop` | B-tree | `nexthop` | Next-hop grouping |
+| `idx_adj_rib_in_updated_at` | B-tree DESC | `updated_at` | Recently changed routes, staleness detection |
+
+---
+
 ### `route_events`
 
 Route change history. Every BGP add or withdraw generates a row. Partitioned by day on `ingest_time` for efficient retention management and time-range queries.
+
+Stores events from **both** Loc-RIB and Adj-RIB-In. The `peer_address`, `peer_asn`, `peer_bgp_id`, and `is_post_policy` columns identify the source peer for Adj-RIB-In events; these are `NULL` for Loc-RIB events.
 
 | Column | Type | Nullable | Default | Description |
 |--------|------|----------|---------|-------------|
@@ -100,6 +158,10 @@ Route change history. Every BGP add or withdraw generates a row. Partitioned by 
 | `communities_large` | `TEXT[]` | yes | `NULL` | Large communities. |
 | `attrs` | `JSONB` | yes | `NULL` | Extra attributes. |
 | `bmp_raw` | `BYTEA` | yes | `NULL` | Raw BMP message bytes. May be zstd-compressed (configurable). |
+| `peer_address` | `INET` | yes | `NULL` | Peer IP that sent this route. `NULL` for Loc-RIB events. |
+| `peer_asn` | `BIGINT` | yes | `NULL` | Peer ASN. `NULL` for Loc-RIB events. |
+| `peer_bgp_id` | `TEXT` | yes | `NULL` | Peer BGP identifier. `NULL` for Loc-RIB events. |
+| `is_post_policy` | `BOOLEAN` | yes | `NULL` | `false` = pre-policy, `true` = post-policy. `NULL` for Loc-RIB events. |
 
 **Primary key:** `(event_id, ingest_time)`
 
@@ -122,7 +184,7 @@ Each daily partition gets two indexes created automatically by the partition man
 
 ### `rib_sync_status`
 
-BMP session synchronization state per router/table/AFI. Tracks whether the ingester has received a complete RIB dump (End-of-RIB marker). Used internally by the ingester for stale-route purging; useful for the API to show sync health.
+BMP session synchronization state per router/table/AFI for **Loc-RIB only**. Tracks whether the ingester has received a complete RIB dump (End-of-RIB marker). Used internally by the ingester for stale-route purging; useful for the API to show sync health.
 
 | Column | Type | Nullable | Default | Description |
 |--------|------|----------|---------|-------------|
@@ -138,15 +200,35 @@ BMP session synchronization state per router/table/AFI. Tracks whether the inges
 
 **Primary key:** `(router_id, table_name, afi)`
 
-**Lifecycle:** Rows are created when the ingester first processes a message for a router/table/AFI combination. On session termination (BMP Peer Down for Loc-RIB), the entire row is deleted along with all routes for that router/table.
+**Lifecycle:** Rows are created when the ingester first processes a Loc-RIB message for a router/table/AFI combination. On session termination (BMP Peer Down for Loc-RIB), the entire row is deleted along with all routes for that router/table.
 
 ---
 
-## Materialized View
+### `adj_rib_in_sync_status`
+
+BMP session synchronization state per router/peer/AFI for **Adj-RIB-In** sessions. Tracks End-of-RIB status per peer. Analogous to `rib_sync_status` but keyed by peer address instead of table name.
+
+| Column | Type | Nullable | Default | Description |
+|--------|------|----------|---------|-------------|
+| `router_id` | `TEXT` | **PK** | — | Router identifier (the BMP speaker). |
+| `peer_address` | `INET` | **PK** | — | IP address of the BGP neighbor. |
+| `afi` | `SMALLINT` | **PK** | — | `4` or `6`. |
+| `session_start_time` | `TIMESTAMPTZ` | yes | `NULL` | When the current BMP session for this peer started. |
+| `eor_seen` | `BOOLEAN` | no | `false` | Whether End-of-RIB has been received from this peer. |
+| `eor_time` | `TIMESTAMPTZ` | yes | `NULL` | When EOR was received. `NULL` if not yet seen. |
+| `updated_at` | `TIMESTAMPTZ` | no | `now()` | Last update to this row. |
+
+**Primary key:** `(router_id, peer_address, afi)`
+
+**Lifecycle:** Rows are created when the ingester first processes an Adj-RIB-In message for a router/peer/AFI combination. On BMP Peer Down, the row is deleted along with all routes for that `(router_id, peer_address)` pair.
+
+---
+
+## Materialized Views
 
 ### `route_summary`
 
-Pre-aggregated route counts per router/table/AFI. Refreshed periodically by the ingester's partition manager (runs on the maintenance schedule — typically every few minutes via `REFRESH MATERIALIZED VIEW CONCURRENTLY`).
+Pre-aggregated Loc-RIB route counts per router/table/AFI. Refreshed periodically by the ingester's partition manager (runs on the maintenance schedule — typically every few minutes via `REFRESH MATERIALIZED VIEW CONCURRENTLY`).
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -164,9 +246,80 @@ Pre-aggregated route counts per router/table/AFI. Refreshed periodically by the 
 
 ---
 
+### `adj_rib_in_summary`
+
+Pre-aggregated Adj-RIB-In route counts per router/peer/policy/table/AFI. Refreshed periodically alongside `route_summary`.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `router_id` | `TEXT` | Router identifier. |
+| `peer_address` | `INET` | BGP neighbor IP. |
+| `peer_asn` | `BIGINT` | BGP neighbor ASN. |
+| `is_post_policy` | `BOOLEAN` | Pre-policy or post-policy view. |
+| `table_name` | `TEXT` | BMP table name. |
+| `afi` | `SMALLINT` | `4` or `6`. |
+| `route_count` | `BIGINT` | Total routes from this peer. |
+| `unique_prefixes` | `BIGINT` | Distinct prefixes. |
+| `unique_nexthops` | `BIGINT` | Distinct next-hop addresses. |
+| `last_update` | `TIMESTAMPTZ` | Most recent `updated_at`. |
+
+**Unique index:** `(router_id, peer_address, peer_asn, is_post_policy, table_name, afi)` — required for `REFRESH CONCURRENTLY`.
+
+**Staleness:** Same caveats as `route_summary`. For exact counts, query `adj_rib_in` directly.
+
+---
+
+## Views
+
+### `peers_overview`
+
+Consolidated per-peer summary joining `adj_rib_in` with `routers` metadata. Provides pre-policy vs post-policy route counts at a glance.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `router_id` | `TEXT` | Router identifier. |
+| `router_hostname` | `TEXT` | Router hostname (from `routers` table). |
+| `peer_address` | `INET` | BGP neighbor IP. |
+| `peer_asn` | `BIGINT` | BGP neighbor ASN. |
+| `peer_bgp_id` | `TEXT` | BGP identifier of the peer. |
+| `pre_policy_routes` | `BIGINT` | Route count where `is_post_policy = false`. |
+| `post_policy_routes` | `BIGINT` | Route count where `is_post_policy = true`. |
+| `total_routes` | `BIGINT` | Total routes from this peer (pre + post policy). |
+| `unique_prefixes` | `BIGINT` | Distinct prefixes from this peer. |
+| `last_update` | `TIMESTAMPTZ` | Most recent `updated_at` across all routes from this peer. |
+
+---
+
+### `routers_overview`
+
+Consolidated router summary joining all data sources. Ensures routers appear in listings even before all BMP message types are processed. Includes both Loc-RIB and Adj-RIB-In aggregate counts.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `router_id` | `TEXT` | Router identifier. |
+| `router_ip` | `INET` | Router IP address. |
+| `hostname` | `TEXT` | Router hostname. |
+| `as_number` | `BIGINT` | Router ASN. |
+| `description` | `TEXT` | Router description. |
+| `display_name` | `TEXT` | Operator-provided display name. |
+| `location` | `TEXT` | Operator-provided location. |
+| `first_seen` | `TIMESTAMPTZ` | First observation time. |
+| `last_seen` | `TIMESTAMPTZ` | Last BMP message time. |
+| `route_count` | `BIGINT` | Loc-RIB route count (from `current_routes`). |
+| `unique_prefixes` | `BIGINT` | Distinct Loc-RIB prefixes. |
+| `adj_rib_in_route_count` | `BIGINT` | Total Adj-RIB-In routes across all peers. |
+| `adj_rib_in_peer_count` | `BIGINT` | Number of distinct BGP peers with Adj-RIB-In data. |
+| `all_afis_synced` | `BOOLEAN` | `true` when EOR received for all AFIs (Loc-RIB only). `NULL` if no sync data. |
+| `session_start_time` | `TIMESTAMPTZ` | Most recent BMP session start. |
+| `sync_updated_at` | `TIMESTAMPTZ` | Last sync status update. |
+
+**Router discovery:** The `known_routers` CTE unions router IDs from `routers`, `rib_sync_status`, `current_routes`, and `adj_rib_in` so a router appears even if only one data source has seen it.
+
+---
+
 ## Query Patterns
 
-### Current RIB
+### Current Loc-RIB
 
 ```sql
 -- All routes for a router
@@ -207,14 +360,122 @@ WHERE prefix = '10.100.0.0/24'
 ORDER BY router_id;
 ```
 
+### Adj-RIB-In
+
+```sql
+-- All peers advertising a specific prefix on a router
+SELECT peer_address, peer_asn, peer_bgp_id, is_post_policy,
+       nexthop, as_path, origin, localpref, med, origin_asn,
+       communities_std, path_id, updated_at
+FROM adj_rib_in
+WHERE router_id = '10.0.0.2'
+  AND prefix = '10.100.0.0/24'
+ORDER BY peer_address, is_post_policy;
+
+-- All routes from a specific peer
+SELECT afi, prefix, path_id, is_post_policy,
+       nexthop, as_path, origin, localpref, med, origin_asn,
+       communities_std, updated_at
+FROM adj_rib_in
+WHERE router_id = '10.0.0.2'
+  AND peer_address = '172.30.0.30'
+ORDER BY afi, prefix;
+
+-- All Adj-RIB-In routes for a router (paginated)
+SELECT peer_address, peer_asn, afi, prefix, path_id,
+       is_post_policy, nexthop, as_path, origin, origin_asn, updated_at
+FROM adj_rib_in
+WHERE router_id = '10.0.0.2'
+ORDER BY peer_address, afi, prefix
+LIMIT 100 OFFSET 0;
+
+-- Pre-policy only (before import filters)
+SELECT * FROM adj_rib_in
+WHERE router_id = '10.0.0.2'
+  AND is_post_policy = false
+ORDER BY peer_address, prefix;
+
+-- Route count per peer (live)
+SELECT peer_address, peer_asn, is_post_policy, afi,
+       COUNT(*) AS route_count,
+       COUNT(DISTINCT prefix) AS unique_prefixes,
+       MAX(updated_at) AS last_update
+FROM adj_rib_in
+WHERE router_id = '10.0.0.2'
+GROUP BY peer_address, peer_asn, is_post_policy, afi
+ORDER BY peer_address, afi;
+
+-- Route count per peer (from materialized view, fast)
+SELECT * FROM adj_rib_in_summary
+WHERE router_id = '10.0.0.2';
+```
+
+### Cross-Reference: Adj-RIB-In vs Loc-RIB
+
+```sql
+-- Compare what each peer offered vs the best path the router selected
+SELECT
+    'adj_rib_in' AS source,
+    a.peer_address::TEXT AS peer_or_table,
+    a.peer_asn,
+    a.is_post_policy,
+    a.nexthop, a.as_path, a.origin, a.localpref, a.med,
+    a.origin_asn, a.communities_std, a.path_id, a.updated_at
+FROM adj_rib_in a
+WHERE a.router_id = '10.0.0.2'
+  AND a.prefix = '10.100.0.0/24'
+  AND a.afi = 4
+
+UNION ALL
+
+SELECT
+    'loc_rib' AS source,
+    c.table_name AS peer_or_table,
+    NULL::BIGINT AS peer_asn,
+    NULL::BOOLEAN AS is_post_policy,
+    c.nexthop, c.as_path, c.origin, c.localpref, c.med,
+    c.origin_asn, c.communities_std, c.path_id, c.updated_at
+FROM current_routes c
+WHERE c.router_id = '10.0.0.2'
+  AND c.prefix = '10.100.0.0/24'
+  AND c.afi = 4
+
+ORDER BY source, peer_or_table;
+```
+
+### Peers
+
+```sql
+-- All peers for a router with route counts
+SELECT * FROM peers_overview
+WHERE router_id = '10.0.0.2'
+ORDER BY peer_address;
+
+-- Peer sync status (EOR received?)
+SELECT * FROM adj_rib_in_sync_status
+WHERE router_id = '10.0.0.2'
+ORDER BY peer_address, afi;
+```
+
 ### Route History
 
 ```sql
--- History for a specific prefix
+-- History for a specific prefix (Loc-RIB events)
 SELECT ingest_time, action, nexthop, as_path, origin_asn
 FROM route_events
 WHERE router_id = '10.0.0.2'
   AND prefix = '10.100.0.0/24'
+  AND peer_address IS NULL
+ORDER BY ingest_time DESC
+LIMIT 100;
+
+-- History for a specific prefix from a specific peer (Adj-RIB-In events)
+SELECT ingest_time, action, peer_address, peer_asn,
+       is_post_policy, nexthop, as_path, origin_asn
+FROM route_events
+WHERE router_id = '10.0.0.2'
+  AND prefix = '10.100.0.0/24'
+  AND peer_address = '172.30.0.30'
 ORDER BY ingest_time DESC
 LIMIT 100;
 
@@ -240,14 +501,21 @@ ORDER BY ingest_time DESC;
 ### Sync Health
 
 ```sql
--- Which routers are synced (EOR received)?
+-- Loc-RIB sync status: which routers are synced (EOR received)?
 SELECT r.router_id, r.hostname, s.afi, s.eor_seen, s.eor_time,
        s.session_start_time, s.updated_at
 FROM rib_sync_status s
 LEFT JOIN routers r ON r.router_id = s.router_id
 ORDER BY s.router_id, s.afi;
 
--- Routers with stale data (no messages in 5 minutes)
+-- Adj-RIB-In sync status: which peers have sent EOR?
+SELECT r.router_id, r.hostname, a.peer_address, a.afi,
+       a.eor_seen, a.eor_time, a.session_start_time, a.updated_at
+FROM adj_rib_in_sync_status a
+LEFT JOIN routers r ON r.router_id = a.router_id
+ORDER BY a.router_id, a.peer_address, a.afi;
+
+-- Routers with stale Loc-RIB data (no messages in 5 minutes)
 SELECT router_id, table_name, afi, updated_at
 FROM rib_sync_status
 WHERE updated_at < now() - interval '5 minutes';
@@ -256,11 +524,19 @@ WHERE updated_at < now() - interval '5 minutes';
 ### Summary / Dashboard
 
 ```sql
--- Route counts per router (from materialized view, fast)
+-- Router overview with Loc-RIB and Adj-RIB-In counts
+SELECT * FROM routers_overview
+ORDER BY router_id;
+
+-- Loc-RIB route counts per router (from materialized view, fast)
 SELECT * FROM route_summary
 ORDER BY router_id, afi;
 
--- Real-time counts (slower, always current)
+-- Adj-RIB-In route counts per peer (from materialized view, fast)
+SELECT * FROM adj_rib_in_summary
+ORDER BY router_id, peer_address, afi;
+
+-- Real-time Loc-RIB counts (slower, always current)
 SELECT router_id, table_name, afi,
        COUNT(*) AS route_count,
        COUNT(DISTINCT prefix) AS unique_prefixes
@@ -273,29 +549,49 @@ GROUP BY router_id, table_name, afi;
 ## Data Lifecycle
 
 ```
-BMP Session Start
-  └─ Ingester receives Initiation message
-       └─ UPSERT into `routers`
+BMP Peer Up (Loc-RIB, peer type 3)
+  └─ Ingester processes Sent OPEN message
+       └─ UPSERT into `routers` (BGP ID, ASN, operator metadata)
        └─ INSERT/UPDATE `rib_sync_status` (session_start_time = now, eor_seen = false)
 
-Route Monitoring (BGP UPDATE with prefixes)
-  └─ For each prefix in the UPDATE:
+BMP Peer Up (Adj-RIB-In, peer type 0/1/2)
+  └─ Ingester processes Sent OPEN message
+       └─ UPSERT into `routers` (BGP ID, ASN from local speaker)
+       └─ INSERT/UPDATE `adj_rib_in_sync_status`
+
+Route Monitoring — Loc-RIB (peer type 3)
+  └─ For each prefix in the BGP UPDATE:
        ├─ action='A' → UPSERT into `current_routes`, INSERT into `route_events`
        └─ action='D' → DELETE from `current_routes`, INSERT into `route_events`
   └─ UPDATE `rib_sync_status` (last_parsed_msg_time / last_raw_msg_time)
 
-End-of-RIB (EOR)
+Route Monitoring — Adj-RIB-In (peer type 0/1/2)
+  └─ For each prefix in the BGP UPDATE:
+       ├─ action='A' → UPSERT into `adj_rib_in`, INSERT into `route_events` (with peer columns)
+       └─ action='D' → DELETE from `adj_rib_in`, INSERT into `route_events` (with peer columns)
+
+End-of-RIB (EOR) — Loc-RIB
   └─ UPDATE `rib_sync_status` (eor_seen = true, eor_time = now)
   └─ DELETE stale routes from `current_routes` WHERE updated_at < session_start_time
 
-BMP Peer Down (Session Termination)
+End-of-RIB (EOR) — Adj-RIB-In
+  └─ UPDATE `adj_rib_in_sync_status` (eor_seen = true, eor_time = now)
+  └─ DELETE stale routes from `adj_rib_in` WHERE updated_at < session_start_time
+     (scoped to that router/peer)
+
+BMP Peer Down — Loc-RIB (peer type 3)
   └─ DELETE all rows from `current_routes` for that router/table
   └─ DELETE `rib_sync_status` row for that router/table
+
+BMP Peer Down — Adj-RIB-In (peer type 0/1/2)
+  └─ DELETE all rows from `adj_rib_in` for that (router_id, peer_address)
+  └─ DELETE `adj_rib_in_sync_status` row for that (router_id, peer_address)
 
 Maintenance (periodic)
   └─ Create daily partitions for route_events (today + tomorrow)
   └─ Drop partitions older than retention period (default: 30 days)
   └─ REFRESH MATERIALIZED VIEW CONCURRENTLY route_summary
+  └─ REFRESH MATERIALIZED VIEW CONCURRENTLY adj_rib_in_summary
 ```
 
 ---
@@ -318,6 +614,14 @@ Maintenance (periodic)
 
 8. **Partition-aware queries on `route_events`.** Always include `ingest_time` in WHERE clauses to enable partition pruning. Without it, PostgreSQL scans all partitions.
 
-9. **`route_summary` staleness.** The materialized view is refreshed on the maintenance schedule (every few minutes). For dashboards where a few minutes of lag is acceptable, query `route_summary`. For exact counts, query `current_routes` with `COUNT(*)`.
+9. **`route_summary` / `adj_rib_in_summary` staleness.** Materialized views are refreshed on the maintenance schedule (every few minutes). For dashboards where a few minutes of lag is acceptable, query the views. For exact counts, query `current_routes` or `adj_rib_in` with `COUNT(*)`.
 
-10. **Session termination deletes routes.** When a BMP session drops, all `current_routes` for that router are removed. The API should handle the case where a previously known router has zero routes (session is down). Check `rib_sync_status` — if no row exists, the session has terminated.
+10. **Session termination deletes routes.** When a BMP session drops, all `current_routes` for that router are removed, and all `adj_rib_in` for that router are removed. The API should handle the case where a previously known router has zero routes (session is down). Check `rib_sync_status` — if no row exists, the Loc-RIB session has terminated. Check `adj_rib_in_sync_status` for per-peer session status.
+
+11. **Loc-RIB vs Adj-RIB-In in `route_events`.** Use `peer_address IS NULL` to filter Loc-RIB-only events. Use `peer_address IS NOT NULL` for Adj-RIB-In events. The `is_post_policy` column distinguishes pre-policy (peer type 0) from post-policy (peer type 1) Adj-RIB-In events.
+
+12. **`peers_overview` for peer dashboards.** Use this view to show all BGP neighbors for a router with pre-policy vs post-policy route counts. Joins with `routers` to include the router hostname.
+
+13. **`routers_overview` for router dashboards.** Includes `adj_rib_in_route_count` and `adj_rib_in_peer_count` alongside Loc-RIB metrics for a complete picture per router.
+
+14. **Pre-policy vs post-policy.** `is_post_policy = false` shows routes **before** the router's import policy is applied. `is_post_policy = true` shows routes **after** import policy. Not all routers send both — the availability depends on the BMP configuration on the router.
