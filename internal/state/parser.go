@@ -25,10 +25,14 @@ type ParsedRoute struct {
 	LocalPref  *uint32
 	MED        *uint32
 	OriginASN  *int
-	CommStd    []string
-	CommExt    []string
-	CommLarge  []string
-	Attrs      map[string]any
+	CommStd      []string
+	CommExt      []string
+	CommLarge    []string
+	Attrs        map[string]any
+	PeerAddress  string // Peer's IP address (empty for Loc-RIB)
+	PeerAS       uint32 // Peer's ASN (0 for Loc-RIB)
+	PeerBGPID    string // Peer's BGP Identifier (empty for Loc-RIB)
+	IsPostPolicy bool   // L-flag: false=pre-policy, true=post-policy
 }
 
 // PeerEvent represents a decoded goBMP peer topic message for session lifecycle.

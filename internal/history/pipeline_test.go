@@ -62,15 +62,13 @@ func buildPathAttr(flags byte, typeCode byte, data []byte) []byte {
 
 // buildPerPeerHeader constructs a 42-byte BMP per-peer header.
 // peerType: 0=Global, 1=RD, 2=Local, 3=LocRIB
-// peerAddr: 4-byte IPv4 address (placed as IPv4-mapped IPv6).
+// peerAddr: 4-byte IPv4 address (12 zero bytes + 4 IPv4, per BMP spec).
 func buildPerPeerHeader(peerType uint8, peerFlags uint8, peerAddr [4]byte) []byte {
 	hdr := make([]byte, 42)
 	hdr[0] = peerType
 	hdr[1] = peerFlags
 	// Distinguisher: 8 bytes at offset 2 (zero)
-	// Peer address: 16 bytes at offset 10 (IPv4-mapped IPv6)
-	hdr[20] = 0xFF
-	hdr[21] = 0xFF
+	// Peer address: 16 bytes at offset 10 (12 zero bytes + 4 IPv4 bytes)
 	copy(hdr[22:26], peerAddr[:])
 	// AS, BGPID, timestamps at offset 26-41 (zero)
 	return hdr
@@ -270,24 +268,50 @@ func TestHistoryProcessRecord_BasicRoute(t *testing.T) {
 	}
 }
 
-func TestHistoryProcessRecord_SkipNonLocRIB(t *testing.T) {
+func TestHistoryProcessRecord_NonLocRIBPeerFields(t *testing.T) {
 	p := newTestHistoryPipeline()
 
-	// Build with peer_type=0 (Global). Should be filtered out.
+	// Build with peer_type=0 (Global). Non-Loc-RIB is now processed for history.
 	nlri := []byte{24, 10, 0, 0}
 	originAttr := buildPathAttr(0x40, bgp.AttrTypeOrigin, []byte{0})
 	nexthopAttr := buildPathAttr(0x40, bgp.AttrTypeNextHop, []byte{192, 168, 1, 1})
 	pathAttrs := append(originAttr, nexthopAttr...)
 	bgpUpdate := buildBGPUpdate(nil, pathAttrs, nlri)
 
-	bmpMsg := buildBMPRouteMonitoring(bmp.PeerTypeGlobal, 0, [4]byte{10, 0, 0, 1}, bgpUpdate, "global")
-	frame := wrapOpenBMP(bmpMsg)
+	// Non-Loc-RIB Route Monitoring with post-policy flag (L-bit).
+	bmpMsg := buildBMPRouteMonitoring(bmp.PeerTypeGlobal, bmp.PeerFlagPostPolicy, [4]byte{10, 0, 0, 1}, bgpUpdate, "")
+	// Set PeerAS (65001) at BMP offset 6+26=32 and PeerBGPID (10.0.0.1) at 6+30=36.
+	binary.BigEndian.PutUint32(bmpMsg[32:36], 65001)
+	bmpMsg[36] = 10; bmpMsg[37] = 0; bmpMsg[38] = 0; bmpMsg[39] = 1
+	frame := wrapOpenBMPV17(bmpMsg, [4]byte{10, 0, 0, 2})
 
 	rec := &kgo.Record{Value: frame, Topic: "gobmp.raw"}
 	rows := p.processRecord(context.Background(), rec)
 
-	if len(rows) != 0 {
-		t.Errorf("expected 0 rows for non-Loc-RIB peer, got %d", len(rows))
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row for non-Loc-RIB peer, got %d", len(rows))
+	}
+	row := rows[0]
+	if row.IsLocRIB {
+		t.Error("expected IsLocRIB=false for Global peer")
+	}
+	if row.PeerAddress != "10.0.0.1" {
+		t.Errorf("expected PeerAddress '10.0.0.1', got '%s'", row.PeerAddress)
+	}
+	if row.PeerAS != 65001 {
+		t.Errorf("expected PeerAS 65001, got %d", row.PeerAS)
+	}
+	if row.PeerBGPID != "10.0.0.1" {
+		t.Errorf("expected PeerBGPID '10.0.0.1', got '%s'", row.PeerBGPID)
+	}
+	if !row.IsPostPolicy {
+		t.Error("expected IsPostPolicy=true for L-flag=1 peer")
+	}
+	if row.Event.Prefix != "10.0.0.0/24" {
+		t.Errorf("expected prefix '10.0.0.0/24', got '%s'", row.Event.Prefix)
+	}
+	if row.Event.Action != "A" {
+		t.Errorf("expected action 'A', got '%s'", row.Event.Action)
 	}
 }
 

@@ -29,6 +29,8 @@ router bgp 65002
       connection mode active port 5000
       export-policy bgp rib bestpaths
       export-policy received routes additional-paths
+      monitor neighbor 172.30.0.30 adj-rib-in pre-policy
+      monitor neighbor 172.30.0.31 adj-rib-in pre-policy
       no shutdown
    !
    address-family ipv4 unicast

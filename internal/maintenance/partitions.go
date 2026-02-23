@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -42,11 +43,30 @@ func (pm *PartitionManager) Run(ctx context.Context) error {
 	return nil
 }
 
-// RefreshSummary refreshes the route_summary materialized view concurrently.
+// RefreshSummary refreshes the route_summary and adj_rib_in_summary materialized views concurrently.
 func (pm *PartitionManager) RefreshSummary(ctx context.Context) error {
-	_, err := pm.pool.Exec(ctx, "REFRESH MATERIALIZED VIEW CONCURRENTLY route_summary")
+	if err := pm.refreshView(ctx, "route_summary"); err != nil {
+		return err
+	}
+	if err := pm.refreshView(ctx, "adj_rib_in_summary"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// refreshView refreshes a single materialized view, ignoring "does not exist" errors
+// (the view may not be created yet on first run).
+func (pm *PartitionManager) refreshView(ctx context.Context, viewName string) error {
+	_, err := pm.pool.Exec(ctx, "REFRESH MATERIALIZED VIEW CONCURRENTLY "+pgx.Identifier{viewName}.Sanitize())
 	if err != nil {
-		pm.logger.Warn("failed to refresh route_summary (may not exist yet)", zap.Error(err))
+		errMsg := err.Error()
+		// 42P01 = undefined_table (view doesn't exist yet)
+		if strings.Contains(errMsg, "42P01") || strings.Contains(errMsg, "does not exist") {
+			pm.logger.Warn("materialized view does not exist yet, skipping refresh",
+				zap.String("view", viewName), zap.Error(err))
+			return nil
+		}
+		return fmt.Errorf("refreshing %s: %w", viewName, err)
 	}
 	return nil
 }

@@ -3,6 +3,8 @@ ALTER TABLE routers ADD COLUMN IF NOT EXISTS display_name TEXT;
 ALTER TABLE routers ADD COLUMN IF NOT EXISTS location TEXT;
 
 -- Recreate routers_overview to include the new columns.
+-- DROP required because CREATE OR REPLACE cannot change column names/order.
+DROP VIEW IF EXISTS routers_overview;
 CREATE OR REPLACE VIEW routers_overview AS
 WITH known_routers AS (
     SELECT router_id FROM routers
